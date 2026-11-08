@@ -69,3 +69,6 @@ jobs:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before || 'HEAD~1' }}
           S2A_SHARED_FONT_DIR: ${{ runner.temp }}/openfonts
         run: bash tools/contrib_check.sh --base "$BASE"
+      - name: 自检失败时打印门禁日志
+        if: failure()
+        run: tail -n 200 build/contrib_check/gate.log
