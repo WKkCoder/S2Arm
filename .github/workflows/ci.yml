@@ -55,6 +55,8 @@ jobs:
           python3 -m pip install -r tools/rewriter-requirements.txt -r pack/fonts/requirements.txt
       - name: 改写器固定依赖（钉版 Capstone / LZ4 源码；构建本身不下载）
         run: python3 runtime/rewriter/prepare_deps.py build/rewriter-deps
+      - name: Windows 启动器离线门禁要的 NuGet 包
+        run: python3 tools/nuget_prefetch.py launchers/windows/launcher
       - name: 钉版时区源码（服务层单测生成 tzdata 用）
         run: bash services/systemdata/make_tzdata.sh --prepare-sources
       - name: 共享字体（开源替代 7 个 .bfttf；字体版本与 sha256 在 make_open_fonts.py 里核）
@@ -70,6 +72,7 @@ jobs:
         env:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before || 'HEAD~1' }}
           S2A_SHARED_FONT_DIR: ${{ runner.temp }}/openfonts
+          GATE_HOOK_S: '1800'
         run: bash tools/contrib_check.sh --base "$BASE"
       - name: 自检失败时打印门禁日志
         if: failure()
