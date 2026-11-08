@@ -68,12 +68,16 @@ jobs:
           "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "ndk;29.0.14206865" "cmake;3.31.6"
       - name: 兼容层上游基线
         run: bash compat/fetch_base.sh
-      - name: 贡献者自检
+      # 托管机 3 核跑不完 runtime 钩子，也没有游戏数据和真音频设备：结果只作参考，合入判定由 linux 作业和列车门禁负责
+      - name: 贡献者自检（参考，不挡合入）
+        id: selfcheck
+        continue-on-error: true
         env:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before || 'HEAD~1' }}
           S2A_SHARED_FONT_DIR: ${{ runner.temp }}/openfonts
-          GATE_HOOK_S: '1800'
         run: bash tools/contrib_check.sh --base "$BASE"
-      - name: 自检失败时打印门禁日志
-        if: failure()
-        run: tail -n 200 build/contrib_check/gate.log
+      - name: 自检没过时打印门禁日志，结论写进摘要
+        if: steps.selfcheck.outcome == 'failure'
+        run: |
+          tail -n 200 build/contrib_check/gate.log
+          cat build/contrib_check/summary.md >> "$GITHUB_STEP_SUMMARY"
