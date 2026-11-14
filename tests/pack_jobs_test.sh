@@ -17,13 +17,12 @@ echo "pack/jobs 单测：跑 ${#sel[@]} 份（$(printf '%s ' "${sel[@]##*/}")）
 #   「\var\folders…」杂文件，两次被 git add -A 带进提交）：每份跑完比一次工作树里未跟踪的文件，多出来的判这份不通、点名
 untracked() { git ls-files --others --exclude-standard 2> /dev/null | LC_ALL=C sort; }
 # 按文件并行跑（11-14 列车提速：68 份串行合计 413 秒，最大一份 test_jobs 106 秒；PACK_JOBS_PAR 路并行，缺省 4，整步约降到最大那份），
-#   各份输出进临时目录，跑完按原顺序判、打印（输出格式不变）。最长的先起（大份先占工人，不排在最后拖尾）。
+#   各份输出进临时目录，跑完按原顺序判、打印（输出格式不变）。
 #   「单测不许往工作树里写」改成整体前后比一次：并行时分不清是哪一份写的，多出来的文件全部点名、判不通
 P=${PACK_JOBS_PAR:-4}; OD=$(mktemp -d "${TMPDIR:-/tmp}/packjobs.XXXXXX"); trap 'rm -rf "$OD"' EXIT
 u0=$(untracked)
-order=(); for t in pack/jobs/tests/test_jobs.py pack/jobs/tests/test_saves.py pack/jobs/tests/test_free_space.py pack/jobs/tests/test_cache_retention.py; do
-  for x in "${sel[@]}"; do [ "$x" = "$t" ] && order+=("$t"); done; done
-for x in "${sel[@]}"; do case " ${order[*]} " in *" $x "*) ;; *) order+=("$x");; esac; done
+# 大份先起：按文件大小从大到小（不写死文件名——单测里点名具体测试文件，路由器会顺着它们的引用把无关的改动也挂到本单测，11-14 gate_route_matrix_test 红）
+order=(); while IFS= read -r t; do order+=("$t"); done < <(ls -S "${sel[@]}")
 printf '%s\0' "${order[@]}" | xargs -0 -P "$P" -n 1 sh -c '
   # 作业层测试一律不起后台商店查询（S2A_BANNER_FETCH=0）：它脱离作业、往测试的临时 library/ 写，收尾删目录时偶发 Directory not empty（11-10）
   n=$(basename "$1"); S2A_BANNER_FETCH=0 python3 -B -m unittest discover -s pack/jobs/tests -p "$n" > "$0/$n.out" 2>&1; echo $? > "$0/$n.rc"' "$OD"
