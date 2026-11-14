@@ -538,7 +538,12 @@ static VkDescriptorPool g_seg_desc[SEGPOOL_DESC_N];
 static uint32_t g_seg_ncmd, g_seg_ndesc; static uint64_t g_seg_hit_cmd, g_seg_hit_desc;
 static int g_seg_closed;   // 会话收尾已经清过表：之后再还回来的一律直接销毁（持 g_seg_mu 读写）
 static pthread_mutex_t g_seg_mu = PTHREAD_MUTEX_INITIALIZER;
-static int seg_reuse_on(void) { static int cur = -1; static uint32_t k; if (cur < 0 || !(++k & 63)) cur = nvn_plat_flag("nvk_seg_reuse", 1) != 0; return cur; }
+static int seg_reuse_on(void) {   // 开关缓存：回放线程（开段）和完成线程（还段）都会调，读写 / 计数用 relaxed 原子（TSan 在 C204 的多段场景里报过这里的数据竞争）
+    static int cur = -1; static uint32_t k;
+    int c = __atomic_load_n(&cur, __ATOMIC_RELAXED);
+    if (c < 0 || !(__atomic_add_fetch(&k, 1, __ATOMIC_RELAXED) & 63)) { c = nvn_plat_flag("nvk_seg_reuse", 1) != 0; __atomic_store_n(&cur, c, __ATOMIC_RELAXED); }
+    return c;
+}
 static int seg_take_cmd(VkCommandPool *pool, VkCommandBuffer *cb) {
     int ok = 0;
     pthread_mutex_lock(&g_seg_mu);
