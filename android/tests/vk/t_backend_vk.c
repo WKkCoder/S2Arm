@@ -49,12 +49,14 @@ void nvn_plat_safepoint(void) {}
 static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0（管线缓存关）
 // C89（局中补写）：-1 = 用后端缺省；>= 0 = 把对应的调试开关读成这个值（后端在开会话时读一次，所以要在 open 之前设、open 之后撤）。
 static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
+static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
     if (!strcmp(name, "nvk_ulist") && g_ulist_flag >= 0) return g_ulist_flag;
     // 整套用例在 nvk_fbdrop=2（自检档）下跑：视图销毁走快路之后再全表扫一遍，扫到残留（反查表没记到的帧缓冲）就报红，main 末尾核「残留 0」。
     if (!strcmp(name, "nvk_fbdrop") && g_fbdrop_flag != -2) return g_fbdrop_flag >= 0 ? g_fbdrop_flag : 2;   // -2 = 读成生产缺省（C201 核缺省档的行为）
+    if (!strcmp(name, "nvk_stg_std") && g_stg_std_flag >= 0) return g_stg_std_flag;
     if (!strcmp(name, "nvk_pipe_cache") && g_plc_flag_off) return 0;
     if (!strcmp(name, "nvk_plc_new") && g_plc_thr_new >= 0) return g_plc_thr_new;
     if (!strcmp(name, "nvk_plc_first_ms") && g_plc_thr_first_ms >= 0) return g_plc_thr_first_ms;
@@ -5857,6 +5859,94 @@ static void c86c_bc_3d_slice_copy(void) {
     nvn_gpu_buf_release(ib, NULL, NULL); nvn_gpu_buf_release(rb, NULL, NULL);
 }
 
+// ---- C202（#1087）：命令段暂存缓冲的回收表只留标准大小（VK_ARENA_MIN = 256 KB）的块 ----
+// 背景：回收表 32 个位置，按「大小完全相同」取用。加载阶段留下的非标准大小块（每块大小各不相同）之后再没人要，会把位置占满，
+// 之后每帧要的标准块一半没命中：每帧各新建、销毁十来次（vkAllocateMemory / vkFreeMemory + 映射的缺页）。
+// 计数从 nvn_gpu_stats 读（stg_pool_hit / miss / kept / rejected / full，开会话清零）。一个命令段第一次 arena_alloc 占一块暂存缓冲，
+// 同时开着 n 个段就同时占 n 块；段做完放回一块。arena 大小 = max(bytes + 16, 256 KB)：1000 字节 → 标准块，300000 + 4096 i 字节 → 各不相同的非标准块。
+// 期望（手算，不取自被测实现；每个会话开始时表空、计数全 0）：
+//  缺省档（只留标准块）：
+//   ① 6 个段各要 1000 字节：没命中 6、命中 0；放回 6 块全留（留 6）；
+//   ② 再来一轮同样的 6 个段：命中 6、没命中仍 6；放回再留 6（累计留 12）；
+//   ③ 40 个段各要不同的非标准大小（分 5 批，每批 8 个同时开）：没命中 40（累计 46）；放回 40 块全因非标准没留（非标准没留 40、留仍 12、表满没留 0）；表里还是 6 块标准块；
+//   ④ 连续 3 轮、每轮 12 个段各要 1000 字节：第 1 轮命中 6、没命中 6（表里只有 6 块）、放回 12 块全留；第 2、3 轮命中 12、没命中 0、放回 12 块全留；表满没留 始终 0。
+//  对照档（nvk_stg_std = 0，旧行为：什么大小都留）：
+//   ①② 同上；③ 40 块非标准块没命中 40，放回时表里只剩 26 个空位：留 26（累计 38）、表满没留 14，非标准没留 0——表被 26 块谁也不会再要的块占着，连同 6 块标准块 = 32 满；
+//   ④ 每轮 12 个段：表里只有 6 块标准块 → 命中 6、没命中 6；放回 12 块只有 6 个空位 → 留 6、表满没留 6。每轮都新建 6 次、销毁 6 次，永远这样（真机世界场景每帧 11.8 次就是这个）。
+struct stg_stats { uint64_t hit, miss, kept, rej, full; int seen; };
+static void stg_stat_cb(void *u, const char *name, uint64_t v) {
+    struct stg_stats *o = (struct stg_stats *)u;
+    if (!strcmp(name, "stg_pool_hit")) { o->hit = v; o->seen++; }
+    else if (!strcmp(name, "stg_pool_miss")) { o->miss = v; o->seen++; }
+    else if (!strcmp(name, "stg_pool_kept")) { o->kept = v; o->seen++; }
+    else if (!strcmp(name, "stg_pool_rejected")) { o->rej = v; o->seen++; }
+    else if (!strcmp(name, "stg_pool_full")) { o->full = v; o->seen++; }
+}
+static struct stg_stats stg_read(void) { struct stg_stats s; memset(&s, 0, sizeof s); nvn_gpu_stats(stg_stat_cb, &s, 0); return s; }
+// 一轮：同时开 n 个段（n <= 16），第 i 个要 bytes0 + i * step 字节的暂存，各做一次 fill，按序提交（围栏号从 *fence 起递增），再等这 n 块都放回。
+static void stg_round(nvn_gpu_buf scratch, int n, uint64_t bytes0, uint64_t step, uint32_t *fence, const char *what) {
+    nvn_gpu_cmd cs[16]; nvn_gpu_err e; struct stg_stats s0 = stg_read();
+    for (int i = 0; i < n; i++) {
+        cs[i] = begin_cmd(); if (!cs[i]) return;
+        nvn_gpu_slice sl; nvn_gpu_rc r = nvn_gpu_arena_alloc(cs[i], bytes0 + (uint64_t)i * step, 16, &sl, &e);
+        CHECK(OK(r), "C202 %s 暂存 %d：%d %s", what, i, r.code, e.why);
+        nvn_gpu_fill_buf(cs[i], scratch, 0, 16, 0xA5A5A5A5u);
+    }
+    for (int i = 0; i < n; i++) {
+        nvn_gpu_rc r = nvn_gpu_cmd_commit(cs[i], (*fence)++, on_done, NULL, &e);
+        CHECK(OK(r), "C202 %s commit %d：%d %s", what, i, r.code, e.why);
+    }
+    CHECK(OK(nvn_gpu_fence_wait(*fence - 1, 5000000000ull, &e)), "C202 %s wait：%s", what, e.why);
+    for (int t = 0; t < 500; t++) {   // 放回在完成线程上、可能比围栏晚一点：等这 n 块都放回（留 / 没留 都算）
+        struct stg_stats s = stg_read();
+        if (s.kept + s.rej + s.full >= s0.kept + s0.rej + s0.full + (uint64_t)n) return;
+        sleep_ms(10);
+    }
+    CHECK(0, "C202 %s：5 秒内 %d 个段的暂存块没都放回", what, n);
+}
+static void c202_arm(int std_flag, const char *tag) {
+    g_stg_std_flag = std_flag;
+    if (!open_backend()) { g_stg_std_flag = -1; return; }
+    nvn_gpu_buf scratch = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+    uint32_t fence = 1; struct stg_stats s, p;
+    int std_on = std_flag != 0;   // 缺省档（-1）与显式 1 都是「只留标准块」
+    s = stg_read();
+    CHECK(s.seen == 5, "C202 %s：后端没报全暂存池读数（stg_pool_*），期望 5 项 → %d 项", tag, s.seen);
+    CHECK(s.hit == 0 && s.miss == 0 && s.kept == 0 && s.rej == 0 && s.full == 0, "C202 %s：开会话时计数期望全 0 → %llu/%llu/%llu/%llu/%llu", tag,
+          (unsigned long long)s.hit, (unsigned long long)s.miss, (unsigned long long)s.kept, (unsigned long long)s.rej, (unsigned long long)s.full);
+    stg_round(scratch, 6, 1000, 0, &fence, "① 6 个标准块");
+    s = stg_read();
+    CHECK(s.hit == 0 && s.miss == 6 && s.kept == 6 && s.rej == 0 && s.full == 0, "C202 %s ①：命中 0 / 没命中 6 / 留 6 / 非标准 0 / 表满 0 → %llu/%llu/%llu/%llu/%llu", tag,
+          (unsigned long long)s.hit, (unsigned long long)s.miss, (unsigned long long)s.kept, (unsigned long long)s.rej, (unsigned long long)s.full);
+    stg_round(scratch, 6, 1000, 0, &fence, "② 再来 6 个标准块");
+    s = stg_read();
+    CHECK(s.hit == 6 && s.miss == 6 && s.kept == 12 && s.rej == 0 && s.full == 0, "C202 %s ②：命中 6 / 没命中 6 / 留 12 / 非标准 0 / 表满 0 → %llu/%llu/%llu/%llu/%llu", tag,
+          (unsigned long long)s.hit, (unsigned long long)s.miss, (unsigned long long)s.kept, (unsigned long long)s.rej, (unsigned long long)s.full);
+    for (int b = 0; b < 5; b++) stg_round(scratch, 8, 300000 + (uint64_t)b * 8 * 4096, 4096, &fence, "③ 非标准块");   // 40 个大小各不相同
+    s = stg_read();
+    if (std_on) CHECK(s.hit == 6 && s.miss == 46 && s.kept == 12 && s.rej == 40 && s.full == 0, "C202 %s ③：命中 6 / 没命中 46 / 留 12 / 非标准没留 40 / 表满 0 → %llu/%llu/%llu/%llu/%llu", tag,
+                      (unsigned long long)s.hit, (unsigned long long)s.miss, (unsigned long long)s.kept, (unsigned long long)s.rej, (unsigned long long)s.full);
+    else CHECK(s.hit == 6 && s.miss == 46 && s.kept == 38 && s.rej == 0 && s.full == 14, "C202 %s ③：命中 6 / 没命中 46 / 留 38 / 非标准没留 0 / 表满 14 → %llu/%llu/%llu/%llu/%llu", tag,
+               (unsigned long long)s.hit, (unsigned long long)s.miss, (unsigned long long)s.kept, (unsigned long long)s.rej, (unsigned long long)s.full);
+    for (int r = 0; r < 3; r++) {
+        p = stg_read();
+        stg_round(scratch, 12, 1000, 0, &fence, "④ 12 个标准块");
+        s = stg_read();
+        uint64_t dh = s.hit - p.hit, dm = s.miss - p.miss, dk = s.kept - p.kept, df = s.full - p.full;
+        uint64_t wh = std_on ? (r == 0 ? 6 : 12) : 6, wm = std_on ? (r == 0 ? 6 : 0) : 6, wk = std_on ? 12 : 6, wf = std_on ? 0 : 6;
+        CHECK(dh == wh && dm == wm && dk == wk && df == wf, "C202 %s ④ 第 %d 轮：命中 %llu / 没命中 %llu / 留 %llu / 表满 %llu → %llu/%llu/%llu/%llu", tag, r + 1,
+              (unsigned long long)wh, (unsigned long long)wm, (unsigned long long)wk, (unsigned long long)wf,
+              (unsigned long long)dh, (unsigned long long)dm, (unsigned long long)dk, (unsigned long long)df);
+    }
+    nvn_gpu_buf_release(scratch, NULL, NULL);
+    nvn_gpu_err ce; CHECK(OK(nvn_gpu_close(5000000000ull, &ce)), "C202 %s close：%d %s", tag, ce.rc.code, ce.why);
+    g_stg_std_flag = -1;
+}
+static void c202_stg_pool(void) {
+    c202_arm(-1, "缺省档");
+    c202_arm(0, "对照档 nvk_stg_std=0");
+}
+
 // ---- C88：驱动管线缓存落盘与读回（#822）----
 // 契约（nvn_backend.h open_desc.cache_dir）：给了目录，后端收尾时把驱动的管线缓存写进去，下一局开会话读回来喂给驱动；
 // NULL = 不落盘。缓存只是加速不是前提：文件坏了 / 驱动不收旧数据 / 目录写不了，会话照常开、管线照常建、close 照常返回 OK。
@@ -7112,6 +7202,13 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    if (getenv("S2A_TEST_STG_ONLY")) {   // 开发时只跑 C202（暂存缓冲回收表；run.sh 不设这个变量）
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        c202_stg_pool();
+        printf("nvn_gpu Vulkan 后端 C202 单跑：%s（%d 处不符）\n", g_fail ? "红" : "绿", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (getenv("S2A_TEST_LOGICOP_ONLY")) {
         if(argc < 2) return 2;
         memset(&g_desc,0,sizeof g_desc);g_desc.host_device=&g_dev;g_desc.app_label="logic-only";
@@ -7492,6 +7589,7 @@ int main(int argc, char **argv) {
     c201_fb_scan(0);
     c201_fb_scan(1);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C201 close：%d %s", e18.rc.code, e18.why);
+    c202_stg_pool();   // 缺省档与对照档各自开 / 关会话（围栏号从各自会话重新算）
 
     for (int sw = 0; sw < 2; sw++) {
         if (!open_backend()) return 1;

@@ -578,13 +578,20 @@ static void seg_give_desc(VkDescriptorPool p) {
 // · 命令段的暂存缓冲（arena 的块，多数是 VK_ARENA_MIN 那么大）：整个缓冲对象留下，大小相同的直接再用。它一直留在 g.bufs 链里，
 //   会话收尾遍历那条链时一起销毁，所以清表只清计数。暂存区是先写后用的，旧内容不用清。
 // · 遮挡查询池：槽数相同的再用；开段时照旧整池重置。
+// 暂存缓冲这张表只留标准大小（VK_ARENA_MIN）的块。真机取样（一款 3D 游戏的世界场景，Adreno 840 调试包，开 nvk_flt 的诊断包）：
+// 每帧用 24 个标准大小的块，表里却长期占着 28 个非标准大小的块（加载阶段留下的，之后再没有谁要同样的大小，每帧放回的非标准块 0 个），
+// 32 个位置只剩 4 个留给标准块：每帧 11.8 次没命中新建（vkAllocateMemory + 映射）、11.8 次表满销毁（vkFreeMemory）。
+// 非标准大小的块不进表、照旧销毁；诊断开关 nvk_stg_std=0 退回旧行为（开会话时读一次，同一局里对照要重开会话），缺省开。
 enum { SEGPOOL_STG_N = 32, SEGPOOL_Q_N = 16 };
 static struct nvn_gpu_buf_s *g_seg_stg[SEGPOOL_STG_N]; static uint32_t g_seg_nstg;
+static int g_seg_stg_std = 1;   // 只留标准大小（开会话时读 nvk_stg_std；持 g_seg_mu 读写）
+static uint64_t g_seg_stg_hit, g_seg_stg_miss, g_seg_stg_kept, g_seg_stg_rej, g_seg_stg_full;   // 取用命中 / 没命中；放回留下 / 因非标准大小没留 / 因表满没留（持 g_seg_mu 读写；会话读数，不随 take 清零）
 static struct { VkQueryPool q; uint32_t n; } g_seg_q[SEGPOOL_Q_N]; static uint32_t g_seg_nq;
 static struct nvn_gpu_buf_s *seg_take_stg(uint64_t bytes) {
     struct nvn_gpu_buf_s *b = NULL;
     pthread_mutex_lock(&g_seg_mu);
     for (uint32_t i = 0; i < g_seg_nstg; i++) if (g_seg_stg[i]->bytes == bytes) { b = g_seg_stg[i]; g_seg_stg[i] = g_seg_stg[--g_seg_nstg]; break; }
+    if (b) g_seg_stg_hit++; else g_seg_stg_miss++;
     pthread_mutex_unlock(&g_seg_mu);
     return b;
 }
@@ -592,7 +599,10 @@ static int seg_give_stg(struct nvn_gpu_buf_s *b) {   // 1 = 留下了；0 = 没�
     int kept = 0;
     if (!seg_reuse_on() || !b->mapped) return 0;
     pthread_mutex_lock(&g_seg_mu);
-    if (!g_seg_closed && g_seg_nstg < SEGPOOL_STG_N) { g_seg_stg[g_seg_nstg++] = b; kept = 1; }
+    if (g_seg_closed) { /* 会话收尾已清过表：直接销毁 */ }
+    else if (g_seg_stg_std && b->bytes != VK_ARENA_MIN) g_seg_stg_rej++;
+    else if (g_seg_nstg >= SEGPOOL_STG_N) g_seg_stg_full++;
+    else { g_seg_stg[g_seg_nstg++] = b; g_seg_stg_kept++; kept = 1; }
     pthread_mutex_unlock(&g_seg_mu);
     return kept;
 }
@@ -1535,7 +1545,9 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
     if (pthread_create(&g.worker, NULL, worker_main, &g) != 0)
         return fail(err, NVN_GPU_E_DEVICE, "worker 线程创建失败");
     g.worker_started = 1;
-    pthread_mutex_lock(&g_seg_mu); g_seg_closed = 0; pthread_mutex_unlock(&g_seg_mu);
+    pthread_mutex_lock(&g_seg_mu); g_seg_closed = 0;
+    g_seg_stg_std = nvn_plat_flag("nvk_stg_std", 1) != 0; g_seg_stg_hit = g_seg_stg_miss = g_seg_stg_kept = g_seg_stg_rej = g_seg_stg_full = 0;
+    pthread_mutex_unlock(&g_seg_mu);
     plc_open(d->cache_dir);   // 缓存是加速不是前提：里面任何一步失败都落到「不带缓存」，不让 open 失败
     g_open = 1;
     return rc(NVN_GPU_OK);
@@ -6088,6 +6100,15 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     fn(user, "pipe_cache_saves_ok", __atomic_load_n(&g_plcw_ok, __ATOMIC_RELAXED));           // 其中写成功的
     fn(user, "pipe_cache_saves_failed", __atomic_load_n(&g_plcw_fail, __ATOMIC_RELAXED));     // 其中写失败的（只记日志；收尾时会再试）
     fn(user, "pipe_cache_saves_same", __atomic_load_n(&g_plcw_same, __ATOMIC_RELAXED));       // 触发了但数据大小与上次保存一致、没写的次数
+    // 命令段暂存缓冲的回收表（开会话起累计，不随 take 清零）
+    pthread_mutex_lock(&g_seg_mu);
+    uint64_t sh = g_seg_stg_hit, sm = g_seg_stg_miss, sk = g_seg_stg_kept, sr = g_seg_stg_rej, sf = g_seg_stg_full;
+    pthread_mutex_unlock(&g_seg_mu);
+    fn(user, "stg_pool_hit", sh);        // 要暂存块时表里有同大小的、直接再用的次数
+    fn(user, "stg_pool_miss", sm);       // 没有同大小的、新建的次数
+    fn(user, "stg_pool_kept", sk);       // 放回时留进表里的次数
+    fn(user, "stg_pool_rejected", sr);   // 放回时因为不是标准大小（nvk_stg_std）没留、照旧销毁的次数
+    fn(user, "stg_pool_full", sf);       // 放回时因为表满没留、照旧销毁的次数
 }
 
 // 用例读：视图全局链与帧缓冲缓存的当前账。0 现存视图数；1 旧路径（nvk_ulist=0）摘链累计走过的节点数（缺省路径恒为 0）；
