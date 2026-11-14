@@ -9,7 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/system_properties.h>
+#include <time.h>
 #include "debug_gate.h"
+#include "flag_cache.h"
 
 const char *nvk_session_cache_dir(void);
 
@@ -21,13 +23,28 @@ void nvn_plat_log(int level, const char *cls, const char *text) {
     if (s2a_debug_entries_open()) fprintf(stderr, "[s2a] %snvk %s: %s\n", level == NVN_PLAT_LOG_RED ? "【红】" : "", cls ? cls : "", text ? text : "");
 }
 
-int nvn_plat_flag(const char *name, int dflt) {
-    if (!name || !s2a_debug_entries_open()) return dflt;
+#if defined(S2A_ANDROID_DEBUG_ENV) && defined(__ANDROID__)   // 与 debug_gate.h 的第一道门同一个条件：玩家包里 s2a_debug_entries_open() 编译期恒假，下面整段不存在
+// 调试包：每个线程缓存开关读数 FLAG_TTL_NS（见 flag_cache.h：回放热路径上每次调用读两次系统属性 + 拼键名，占回放线程样本的 6–12%）；
+// 过期重读，adb setprop 改开关最迟一个 TTL 后生效。
+enum { FLAG_TTL_NS = 250 * 1000 * 1000 };
+static int plat_flag_read(const char *name, int *val, void *user) {
+    (void)user;
+    if (!s2a_debug_entries_open()) return 0;
     char key[PROP_NAME_MAX + 32], v[PROP_VALUE_MAX] = {0};
     snprintf(key, sizeof key, "debug.s2a.%s", name);
-    if (__system_property_get(key, v) <= 0 || !v[0]) return dflt;
-    return atoi(v);
+    if (__system_property_get(key, v) <= 0 || !v[0]) return 0;
+    *val = atoi(v);
+    return 1;
 }
+int nvn_plat_flag(const char *name, int dflt) {
+    static __thread struct fc_tab tab;
+    if (!name) return dflt;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return fc_get(&tab, name, dflt, (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec, FLAG_TTL_NS, plat_flag_read, NULL);
+}
+#else
+int nvn_plat_flag(const char *name, int dflt) { (void)name; return dflt; }   // 玩家包：开关一律取缺省（s2a_debug_entries_open() 编译期恒假）
+#endif
 
 // 回放循环的安全点（nvn_plat.h）：运行时改内存映射要所有游戏线程停下，回放所在的游戏线程一次提交可连续跑数秒，
 // 在命令之间让它停到事务结束（android/native/runtime/fault/thread_android.inc）。诊断目标不链运行时：弱符号。
