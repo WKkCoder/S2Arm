@@ -502,9 +502,13 @@ public sealed partial class EnvironmentWindow
         if (exportQueue.Any(q => q.Game.Id == game.Id)) return "queued";
         // 出包（单款或批量）在跑时别的款不挡、点了就排队，出完接着出（同 Mac S2ArmLauncherModel.export，「不许堵门」）；
         //   正在出的这款本身、别的作业锁着这款（装机只锁装的那款，导入 / 游戏库 / 释放空间锁全部）、环境检查中照旧挡
-        if (busy || jobs.Any(j => j.Kind != JobKind.Pack && j.Blocks(game.Id)) || ((packRunning || batchRunning) && packGame?.Id == game.Id)) return "busy";
+        if (LockedNow(game)) return "busy";
         return null;
     }
+
+    /// <summary>这款现在被锁着、不能起出包：环境检查中、别的作业锁着这款（出包作业除外，那种排队）、或正在出的就是这款</summary>
+    private bool LockedNow(LibraryGame game) =>
+        busy || jobs.Any(j => j.Kind != JobKind.Pack && j.Blocks(game.Id)) || ((packRunning || batchRunning) && packGame?.Id == game.Id);
 
     private PackJobClient.Request PackRequest(string operation, string gameId, IReadOnlyDictionary<string, object?>? extra = null) =>
         new(paths, privateRoot, connectedFolder!, libraryId!, operation, gameId, extra);
@@ -531,16 +535,18 @@ public sealed partial class EnvironmentWindow
         packOperation = RunPackAsync(game, spaceOverride);
     }
 
-    /// <summary>出包（单款或一批）收尾后接着出排队的下一款；那款这时出不了（被删 / 被移出游戏库 / 别的作业锁着）就跳过、接着下一款，
-    /// 原因照常在它的出包页左边写着。不跳出包页：玩家正看着别的页就留在原页，状态在顶栏和出包页看得到</summary>
+    /// <summary>出包（单款或一批）收尾后、以及任何作业收尾后（EndJob）接着出排队的下一款。排头那款被别的作业暂时锁着
+    ///   （出包收尾紧跟着刷新游戏库，那一下所有款都锁着）就原样留在排头、等下一个作业收尾再看；只有这款已不在游戏库、或出 iPhone 关了才从队里拿掉。
+    /// 不跳出包页：玩家正看着别的页就留在原页，状态在顶栏和出包页看得到</summary>
     private void PumpExportQueue()
     {
         while (!packRunning && !batchRunning && exportQueue.Count > 0)
         {
             var (queued, spaceOverride, location) = exportQueue[0];
-            exportQueue.RemoveAt(0);
             var game = catalog?.Games.FirstOrDefault(g => g.Id == queued.Id && !g.Hidden);
-            if (game is null || ExportStops(game)) continue;
+            if (game is not null && exportIos && LockedNow(game)) return;   // 暂时锁着：留在排头，等作业收尾再来
+            exportQueue.RemoveAt(0);
+            if (game is null || !exportIos) continue;   // 已不在游戏库 / 出 iPhone 关了：拿掉，接着下一款
             var watching = page == "progress";
             packLocation = location;
             ResetPack(game);
