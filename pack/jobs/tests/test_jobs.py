@@ -917,6 +917,25 @@ class JobsTests(unittest.TestCase):
             self.assertIn("logs/t1-degrade.log", archive.namelist())
             self.assertEqual(json.loads(archive.read("manifest.json"))["degrade_summary"], {"t1": {"rewrite/x18": 30, "direct/lazy": 5}})
 
+    def test_diagnostics_carries_pipeline_records(self):
+        # 本机管线记录（11-13 维护者：诊断收进众包种子）：游戏库里各款 temp/<号>/wire/<号>/pso_user.tsv 原样进 pso/<号>.tsv；没跑过（没这份）的不放；
+        #   空文件、超过 4 MB 的、链接都不放。期望按规则手写
+        import zipfile
+        A, B, C, D = "0100AAAA00000000", "0100BBBB00000000", "0100CCCC00000000", "0100DDDD00000000"
+        atomic(self.c.library / "catalog.json", dict(schema=1, games=[dict(id=g, name=g) for g in (A, B, C, D)]))
+        def rec(g, data):
+            f = self.c.library / "temp" / g / "wire" / g / "pso_user.tsv"; f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(data); return f
+        rec(A, b"S\t0123456789abcdef_b\t1\nC\t1111222233334444_b\n")
+        rec(C, b"")
+        rec(D, b"x" * ((4 << 20) + 1))
+        destination = self.root / "diag-pso.zip"; destination.unlink(missing_ok=True); self.c.r["path"] = str(destination)
+        library.diagnostics(self.c)
+        with zipfile.ZipFile(destination) as archive:
+            names = sorted(n for n in archive.namelist() if n.startswith("pso/"))
+            self.assertEqual(names, [f"pso/{A}.tsv"])
+            self.assertEqual(archive.read(f"pso/{A}.tsv"), b"S\t0123456789abcdef_b\t1\nC\t1111222233334444_b\n")
+            self.assertIn(f"pso/{A}.tsv", json.loads(archive.read("manifest.json"))["files"])
+
     def test_diagnostics_player_note(self):
         # 故障报修的可选文本框（11-13 维护者）：请求带 note 就原样（去首尾空白）进 manifest.json 的 note，收件服务与 iOS 同字段；不填 / 空白不写
         import zipfile
