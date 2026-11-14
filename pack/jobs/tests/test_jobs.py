@@ -939,6 +939,24 @@ class JobsTests(unittest.TestCase):
             with zipfile.ZipFile(destination) as archive:
                 self.assertEqual(json.loads(archive.read("manifest.json")).get("note"), expect)
 
+    def test_diagnostics_names_the_game(self):
+        # 11-14 诊断#e68047：Mac / Windows 诊断包 manifest 没有 game.title_id，报告程序号成了「-」，不同游戏的停帧被并成一单。
+        #   只认导出请求带的游戏号（启动器「故障报修」传玩家选中的那款）；没带就不写——任务记录里最近玩的那款也不拿来猜
+        import zipfile
+        jobs = self.c.jobpath.parent; jobs.mkdir(parents=True, exist_ok=True)
+        (jobs / "mid.json").write_text(json.dumps({"id": "mid", "operation": "play", "state": "completed", "gameId": "0100F2C0115B6000"}), encoding="utf-8")
+        def game_of():
+            destination = self.root / "diag-game.zip"; destination.unlink(missing_ok=True); self.c.r["path"] = str(destination)
+            library.diagnostics(self.c)
+            with zipfile.ZipFile(destination) as archive:
+                return json.loads(archive.read("manifest.json")).get("game")
+        for given, expect in ((None, None), ("", None), ("not-a-title", None), ("0400a3a01ee4c000", {"title_id": "0400A3A01EE4C000"})):
+            self.c.r.pop("gameId", None)
+            if given is not None:
+                self.c.r["gameId"] = given
+            self.assertEqual(game_of(), expect, given)
+        self.c.r.pop("gameId", None)
+
     def test_diagnostics_export_to_volume_whose_new_files_change_inode(self):
         # exFAT / FAT（macOS 驱动）：新文件写入数据、分到存储后 inode 号会变（本机 exFAT 镜像实测：mkstemp 后 18446744073709404714，写完 32987）。
         #   模拟这条规则：空文件的 fstat 给一个临时号，有数据后给真号。期望导出照常成功、诊断包在所选位置；
