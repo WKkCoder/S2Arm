@@ -17,9 +17,12 @@
 #include "direct/sha256.h"
 #include "direct/s2a_direct.h"
 #include "../../runtime/include/s2a_direct_host.h"
-#include "../native/gfx_plat/nvk_session.h"
 #include "direct/jv.h"
 #include "tbuf_spirv_fixtures.h"
+
+// 实现在 nvk_shader.c，声明在 nvk_session.h。这里不包 nvk_session.h：nvk_compile_stop_test.py 拿本文件当夹具，
+// 会在同一个翻译单元里把 nvk_session_request_stop 等会话函数定义成 static，包了头就是「static 声明跟在非 static 声明后面」，编不过。
+uint64_t nvk_shader_cs_fast_hits(void);
 
 static int checks, failures, compiler_calls, diag_enabled, diag_lines, diag_queries;
 static unsigned fake_array_count;
