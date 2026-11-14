@@ -298,6 +298,17 @@ nvn_gpu_rc nvn_gpu_present(nvn_gpu_surface s, const nvn_gpu_drawable *dr, const 
           snprintf(b, sizeof b, "描述符细分（每帧毫秒，近 300 帧）：分配 %.2f、构造写入项 %.2f、写入 %.2f、绑定 %.2f；每帧重写 %.0f 组（其中备忘命中 %.0f 组）、写 %.0f 条描述符",
               v4[0] / 300.0 / 1e6, v4[1] / 300.0 / 1e6, v4[2] / 300.0 / 1e6, v4[3] / 300.0 / 1e6, nst / 300.0, __atomic_exchange_n(&g_desc_hit, 0, __ATOMIC_RELAXED) / 300.0, nwt / 300.0);
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
+        { static uint64_t lnew, lreuse, lput, lfreed, ltrim, lbusy;   // 描述符组按布局回收（#1096）：计数开会话起累计，这里按两次打印之差算每帧
+          pthread_mutex_lock(&g_dset_mu);
+          const uint64_t n1 = g_dset_new, r1 = g_dset_reuse, p1 = g_dset_put, f1 = g_dset_freed, t1 = g_dset_trimmed; const uint32_t np1 = g_dset_npools, nb1 = g_dset_nbins;
+          pthread_mutex_unlock(&g_dset_mu);
+          const uint64_t b1 = __atomic_load_n(&g_dset_busy, __ATOMIC_RELAXED), idle1 = dset_idle_total();
+          if (n1 < lnew || r1 < lreuse || p1 < lput || f1 < lfreed || t1 < ltrim || b1 < lbusy) lnew = lreuse = lput = lfreed = ltrim = lbusy = 0;   // 新会话：计数从 0 重来
+          snprintf(b, sizeof b, "描述符组回收（每帧，近 300 帧）：复用 %.1f、新分 %.1f、放回 %.1f、放弃还池 %.1f、清扫还池 %.1f、碰锁退回 %.2f 次；空闲 %llu 组、增长池 %u 个、布局 %u 项；nvk_dset_rec=%d",
+              (double)(r1 - lreuse) / 300.0, (double)(n1 - lnew) / 300.0, (double)(p1 - lput) / 300.0, (double)(f1 - lfreed) / 300.0, (double)(t1 - ltrim) / 300.0, (double)(b1 - lbusy) / 300.0,
+              (unsigned long long)idle1, np1, nb1, __atomic_load_n(&g_dset_on, __ATOMIC_RELAXED));
+          lnew = n1; lreuse = r1; lput = p1; lfreed = f1; ltrim = t1; lbusy = b1;
+          nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b); }
         { static const char *const nm[8] = {"建图", "要显存并绑定", "默认视图", "帧缓冲", "附件视图", "拆视图", "从帧缓冲表里摘", "拆贴图"}; int o = snprintf(b, sizeof b, "建拆细分（每帧毫秒 / 次，近 300 帧）：");
           for (int i = 0; i < 8 && o < (int)sizeof b - 40; i++) o += snprintf(b + o, sizeof b - (size_t)o, "%s%s %.2f / %.1f", i ? "、" : "", nm[i], __atomic_exchange_n(&g_life_ns[i], 0, __ATOMIC_RELAXED) / 300.0 / 1e6, __atomic_exchange_n(&g_life_n[i], 0, __ATOMIC_RELAXED) / 300.0);
           nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", b);

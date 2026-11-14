@@ -398,6 +398,10 @@ if ! grep -q "C907 保留路径管线缓存落盘：已核对" "$out/log"; then
     echo "【红】没跑到 C907（停局保留会话时的管线缓存落盘）" >&2
     exit 1
 fi
+if ! grep -q "C204 描述符组按布局回收：A…I 九个臂已核对" "$out/log"; then
+    echo "【红】没跑到 C204（描述符组按布局回收，九个臂）" >&2
+    exit 1
+fi
 bad=$(grep -cE "Validation Error|VUID-" "$out/log" || true)
 if [ "$bad" -ne 0 ]; then
     echo "【红】validation 报错 $bad 条：" >&2
@@ -430,6 +434,19 @@ bad=$(grep -cE "Validation Error|VUID-" "$out/log_memo" || true)
 if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ]; then
     echo "【红】描述符组备忘开着的那一遍：rc=${rc}，validation 报错 $bad 条" >&2
     grep -E "Validation Error|VUID-" "$out/log_memo" | head -20 >&2
+    exit 1
+fi
+
+# 描述符组按布局回收关掉（开关 nvk_dset_rec=0，回到每笔向驱动分配）再跑一遍：像素期望不变、校验层 0 条。
+# C204 各臂自带开关值，这一遍管的是其余用例走老路径（缺省那三遍跑的是回收开着）。
+set +e
+S2A_TEST_DSET_REC=0 timeout 600 "$out/t_backend_vk" "$out/shaders" 2>&1 | tee "$out/log_dset0"
+rc=${PIPESTATUS[0]}
+set -e
+bad=$(grep -cE "Validation Error|VUID-" "$out/log_dset0" || true)
+if [ "$rc" -ne 0 ] || [ "$bad" -ne 0 ]; then
+    echo "【红】描述符组回收关着的那一遍：rc=${rc}，validation 报错 $bad 条" >&2
+    grep -E "Validation Error|VUID-" "$out/log_dset0" | head -20 >&2
     exit 1
 fi
 
