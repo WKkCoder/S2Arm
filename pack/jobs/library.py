@@ -157,6 +157,7 @@ def diagnostic_log_excerpt(source, size, head=None, tail=None):
 DIAGNOSTIC_JOB_LIMIT = 4 << 20
 PHONE_TEXT = (".log", ".txt", ".tsv", ".json", ".ips", ".csv")   # 拉回的手机诊断里按文本脱敏收的类型（host.log、logs/、frames.tsv、threads.txt、diag/*.json、metrickit 等）
 DIAG_RUN_FILE_LIMIT = 4 << 20    # 诊断局 PNG：单张上限
+DIAG_PSO_FILE_LIMIT = 4 << 20   # 本机管线记录 pso_user.tsv 单份上限（实测约 1 MB；收件单个成员上限 16 MB）
 DIAG_RUN_TOTAL_LIMIT = 40 << 20  # 诊断局 PNG：总量上限（#438 定）
 
 
@@ -2973,6 +2974,19 @@ def diagnostics(c):
                             continue
                         archive.writestr(f"diagrun/{g['id']}_{f.name}", f.read_bytes())
                         used += n
+                # 本机管线记录（11-13 维护者：玩家上传的诊断收进随包种子，取件按程序号收进众包 zc_crowd.tsv）：各款文档目录 temp/<号>/wire/<号>/pso_user.tsv
+                #   （build.runtime_env 的 S2A_DOCS，宿主 nvn_mtl.m pso_user_path），原样放 pso/<号>.tsv。只有着色器键与管线状态的十六进制，不含个人信息、不过脱敏；
+                #   单份超过 4 MB 跳过；链接不跟。Windows 不在本机跑游戏，没有这份就不放
+                step = "读本机管线记录"
+                for g in sorted(c.catalog().get("games", []), key=lambda g: g.get("id", "")) if c.library.is_dir() else []:
+                    c.check()
+                    gid = (g.get("id") or "").upper()
+                    if not re.fullmatch(r"[0-9A-F]{16}", gid):
+                        continue
+                    f = c.library / "temp" / gid / "wire" / gid / "pso_user.tsv"
+                    if f.is_symlink() or not f.is_file() or not 0 < f.stat().st_size <= DIAG_PSO_FILE_LIMIT:
+                        continue
+                    archive.writestr(f"pso/{gid}.tsv", f.read_bytes())
                 manifest = dict(schema=1,   # 诊断上传服务收件要它（维护方方案「上传协议」：没有 schema 判 not_diag 拒收）；iOS ios/diag.m 同字段
                                 launcher_version=launcher_version(),
                                 macos_version=platform.mac_ver()[0] or {"error": "macOS 版本不可用"},
