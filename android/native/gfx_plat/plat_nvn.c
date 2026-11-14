@@ -75,12 +75,15 @@ int dm_opmode(void) { const char *d = getenv("S2A_DOCKED"); return d && d[0] == 
 enum { PROF_RING = 1 << 16, PCH_N = 1 << 17, PCH_TOP = 8000, PROF_CH = 3 };
 static uintptr_t g_prof_ring[PROF_RING]; static uint32_t g_prof_tid[PROF_RING]; static _Atomic uint64_t g_prof_w;
 static uintptr_t g_prof_lr[PROF_RING], g_prof_ch[PROF_RING][PROF_CH];
-static int g_prof_mode, g_prof_pipe[2] = {-1, -1}; static atomic_flag g_prof_busy = ATOMIC_FLAG_INIT;
+static int g_prof_mode, g_prof_pipe[2] = {-1, -1};
+#if defined(__aarch64__) && !defined(__APPLE__)   // 只有下面信号处理函数的 aarch64 分支用到；宿主单测（x86 / 苹果芯片）也编本文件，不留未用的静态定义（-Werror）
+static atomic_flag g_prof_busy = ATOMIC_FLAG_INIT;
 static int prof_peek16(uintptr_t addr, uintptr_t out[2]) {   // 读 addr 处 16 字节（前一个是上一帧的帧指针，后一个是返回地址）
     if ((addr & 7) || addr < 0x10000) return 0;
     if (write(g_prof_pipe[1], (const void *)addr, 16) != 16) return 0;
     return read(g_prof_pipe[0], out, 16) == 16;
 }
+#endif
 static void prof_sig(int sig, siginfo_t *si, void *uc) {
     (void)sig; (void)si;
     uintptr_t lr = 0, ch[PROF_CH] = {0, 0, 0};
