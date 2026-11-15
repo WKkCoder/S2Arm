@@ -51,8 +51,14 @@ static int g_plc_flag_off;   // C88：1 = 调试开关 nvk_pipe_cache 读成 0�
 static int g_plc_thr_new = -1, g_plc_thr_first_ms = -1, g_plc_thr_every_ms = -1;
 static int g_stg_std_flag = -1;   // C202：-1 = 后端缺省；>= 0 = 把调试开关 nvk_stg_std 读成这个值（后端在开会话时读一次，所以要在 open 之前设）
 static int g_ulist_flag = -1, g_fbdrop_flag = -1;   // C201：nvk_ulist：-1 = 生产缺省，>= 0 = 读成这个值；nvk_fbdrop：-1 = 自检档（整套用例的默认），-2 = 生产缺省，>= 0 = 读成这个值（改完要让后端的开关缓存作废：nvn_vk_dbg_view_stat(5)）
+static int g_dsetrec_flag = -1;   // C204：nvk_dset_rec：-1 = 整套用例的默认（环境变量 S2A_TEST_DSET_REC=0 / 1 指定；没设就读生产缺省），-2 = 生产缺省，>= 0 = 读成这个值（后端在开会话时读一次）
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "display_timing") && g_shown_timing_test) return 1;
+    if (!strcmp(name, "nvk_dset_rec")) {
+        if (g_dsetrec_flag >= 0) return g_dsetrec_flag;
+        if (g_dsetrec_flag == -1 && getenv("S2A_TEST_DSET_REC")) return atoi(getenv("S2A_TEST_DSET_REC")) != 0;
+        return dflt;
+    }
     if (!strcmp(name, "nvk_ulist") && g_ulist_flag >= 0) return g_ulist_flag;
     // 整套用例在 nvk_fbdrop=2（自检档）下跑：视图销毁走快路之后再全表扫一遍，扫到残留（反查表没记到的帧缓冲）就报红，main 末尾核「残留 0」。
     if (!strcmp(name, "nvk_fbdrop") && g_fbdrop_flag != -2) return g_fbdrop_flag >= 0 ? g_fbdrop_flag : 2;   // -2 = 读成生产缺省（C201 核缺省档的行为）
@@ -79,6 +85,15 @@ static int g_c66_inject_pool_limit;
 static unsigned g_c66_sets_requested, g_c66_rejects;
 static VkDescriptorPool g_c66_pool;
 static unsigned g_desc_sets_total;
+// 描述符组按布局回收（#1096）的读数钩子（后端导出，见 backend_vulkan.c）：0 新分 / 1 复用 / 2 放回 / 3 放弃的段还给池 / 4 交给 alloc_sets 的总数 /
+// 5 空闲串里的组 / 6 表项数 / 7 增长池个数 / 8 dead 的表项数 / 9 回收是否开着（开会话时读的开关）/ 13 沿登记表遍历数出来的表项数（应恒等于 6）
+uint64_t nvn_vk_dbg_dset_stat(int which);
+void nvn_vk_dbg_dset_hold(int on);     // 1 = 测试线程自己持着回收表的锁（取组碰锁退回老路径）；0 = 放开。持着期间只能读 nvn_vk_dbg_dset_stat(9 / 11)
+void nvn_vk_dbg_dset_inject(int mode);   // 0 不注入；1 一批（> 1 组）向驱动要组时回「池耗尽」；2 任何一次向增长池要组都回「池耗尽」
+void nvn_vk_dbg_dset_failreg(int n);   // 接下来 n 次登记表项当作内存不够（0 = 取消）：被注入的取组退回老路径、不记结果，下一次取组再登记；每个臂收尾时取消
+// 后端「要了几组」：驱动里分出去的组数，扣掉回收表整批多分的、加上回收表交出去的（回收开着时一次向驱动分一批，驱动计数不等于后端要了几组）。
+// 只用差值：回收表的计数每个会话从 0 起，驱动计数是整个进程的。
+static unsigned desc_demand(void) { return g_desc_sets_total - (unsigned)nvn_vk_dbg_dset_stat(0) + (unsigned)nvn_vk_dbg_dset_stat(4); }
 VKAPI_ATTR VkResult VKAPI_CALL __real_vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo *, VkDescriptorSet *);
 VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *info, VkDescriptorSet *sets) {
     if (g_c66_inject_pool_limit) {
@@ -4779,6 +4794,8 @@ static void c65_depth_only_pass(void) {
 // C66：一段命令里的描述符组数不设上限。测试的链接包装器模拟严格执行池上限的驱动：每个池第 65 组起返回池耗尽。
 // 一段里连发 70 次派发（每次 1 组）：第 65 次在第一个池上被拒 → 后端换新池重分 → 新池上分第 65–70 次共 6 组。
 // 期望（手算）：被拒 1 次；最后一个池上累计请求 6 组；提交成功；派发的结果正确（comp.comp 把 v[i] 写成 i + 1）。
+// 回收开着时（#1096）向驱动要组按 1、2、4、8 翻倍，每批多出的组留给后面的派发，前面的用例也可能在回收表里留下同布局的空闲组，这一段先取它们、少向驱动要；
+// 所以派发数 = 80 + 开段时回收表里全部空闲组数（上界），向驱动要的组数 ≥ 80、仍越过每池 64 组的上限；回收关着时派发数仍是 70，严格数字不变。
 static void c66_pool_sets(const char *dir) {
     nvn_gpu_layout_ent ce;
     memset(&ce, 0, sizeof ce);
@@ -4792,7 +4809,8 @@ static void c66_pool_sets(const char *dir) {
     CHECK(cp != NULL, "C66 cpipe 为空");
     if (!cp) return;
     uint64_t stride = g_dev.properties.limits.minStorageBufferOffsetAlignment; if (stride < 64) stride = 64;
-    nvn_gpu_buf buf = make_buf(stride * 70, NVN_GPU_MEM_SHARED, NULL);
+    const int n66 = nvn_vk_dbg_dset_stat(9) ? 80 + (int)nvn_vk_dbg_dset_stat(5) : 70;
+    nvn_gpu_buf buf = make_buf(stride * (uint64_t)n66, NVN_GPU_MEM_SHARED, NULL);
     nvn_gpu_cmd c = begin_cmd();
     nvn_gpu_set_pipe(c, cp);
     nvn_gpu_binding b;
@@ -4801,29 +4819,479 @@ static void c66_pool_sets(const char *dir) {
     nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1);
     // 计算派发也复用；真实重复派发不得多分配，后面的压力段仍让每笔offset变化。
     b.u.b.off = 69 * stride; nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1);
-    unsigned before = g_desc_sets_total; nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
-    CHECK(g_desc_sets_total - before == 1, "C66 首派发分配1组");
-    before = g_desc_sets_total; nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1); nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
-    CHECK(g_desc_sets_total == before, "C66 相同派发不分配");
+    unsigned before = desc_demand(); nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
+    CHECK(desc_demand() - before == 1, "C66 首派发分配1组");
+    before = desc_demand(); nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1); nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
+    CHECK(desc_demand() == before, "C66 相同派发不分配");
     g_c66_sets_requested = g_c66_rejects = 0;
     g_c66_pool = VK_NULL_HANDLE;
     g_c66_inject_pool_limit = 1;
-    for (int i = 0; i < 70; i++) {
+    for (int i = 0; i < n66; i++) {
         b.u.b.off = (uint64_t)i * stride; nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1);
         nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
     }
     g_c66_inject_pool_limit = 0;
     nvn_gpu_err e;
     nvn_gpu_rc r = nvn_gpu_cmd_commit(c, 112, on_done, NULL, &e);
-    CHECK(g_memo_on || (g_c66_rejects == 1 && g_c66_sets_requested == 6), "C66 应被拒 1 次、新池上请求 6 组，实为 被拒 %u 次、%u 组", g_c66_rejects, g_c66_sets_requested);
+    // 回收开着时一次向驱动要一批（1、2、4、8 组），被拒的次数与新池上的请求数随批大小变，这条严格数字只对老路径成立；回收开着时的池上限见 C204 臂 C。
+    CHECK(g_memo_on || (nvn_vk_dbg_dset_stat(9) ? g_c66_rejects >= 1 : (g_c66_rejects == 1 && g_c66_sets_requested == 6)), "C66 应被拒 1 次、新池上请求 6 组（回收开着：被拒 ≥ 1 次），实为 被拒 %u 次、%u 组", g_c66_rejects, g_c66_sets_requested);
     CHECK(OK(r), "C66 commit：%d %s", r.code, e.why);
     r = nvn_gpu_fence_wait(112, 5000000000ull, &e);
     CHECK(OK(r), "C66 wait：%d %s", r.code, e.why);
-    for (int k = 0; k < 70; k++) { const uint32_t *v = (const uint32_t *)(buf_cpu(buf) + k * stride); int bad = -1;
+    for (int k = 0; k < n66; k++) { const uint32_t *v = (const uint32_t *)(buf_cpu(buf) + k * stride); int bad = -1;
         for (int i = 0; i < 16; i++) if (v[i] != (uint32_t)i + 1) { bad = i; break; }
         CHECK(bad < 0, "C66 第%d笔输出项%d不符", k, bad); }
     nvn_gpu_buf_release(buf, NULL, NULL);
     nvn_gpu_shader_release(sh);
+}
+
+// C204（#1096）：描述符组按布局回收。真机世界场景每帧 2263 次 vkAllocateDescriptorSets（一组一次，约 1.25 毫秒，驱动里每次还有一轮堆分配 / 释放）；
+// 后端改成按布局留一串空闲的组：段完成把取过的组整批放回、下一段直接取；放弃的段不放回、一律还给池；向驱动要组一次 1、2、4、8 组地翻倍（封顶 8），池分满换新池；
+// 空闲串按「在途峰值」设上限，超出的清扫时还给池；连续两格窗口没被取过的表项（冷表项）整串还给池、批大小归零。
+// 用计算管线（C66 同法）：一段里连发 N 次派发、每次换 SSBO 偏移，所以每次派发都要一个新组；comp.comp 把 v[i] 写成 i + 1。
+// 每一轮开始前把整块缓冲清零、跑完逐槽核对：两次派发共用了同一个组、或取到了别人的组，都会让某个槽留 0。每个臂自己开 / 关一个会话（开关在开会话时读）。
+// 期望值（手算；N = 70；向驱动要组的批大小依次 1、2、4、8、8、…，累计 1、3、7、15、23、31、39、47、55、63、71）：
+//   臂 A（回收开）：第 1 轮回收表是空的，向驱动要 11 批（1 + 2 + 4 + 8 × 8）= 71 组（每批第 1 组直接交出、其余留进空闲串给后面的派发：复用 70 - 11 = 59），段完成放回 70 → 空闲 71；
+//                   第 2…6 轮：向驱动新分 0 组（驱动里的分配计数也不动）、复用 70、放回 70，空闲恒为 71；
+//                   第 7 轮放弃（记录完不提交）：复用 70、放回 0、还给池 70，空闲 1；第 8 轮补分 ≥ 68 组（批大小已是 8：先取空闲的 1 组，再要 9 批 72 组），第 9…10 轮又回到新分 0；
+//                   全部段结束后两条恒等式：交出 == 放回 + 还给池；向驱动要来的 == 空闲 + 还给池 + 清扫还池。回放线程取组碰锁退回老路径 0 次。
+//   臂 B（回收关，对照）：每轮驱动里的分配计数 +70（老路径一组一次），回收表的计数全程为 0——证明「新分 0」这个读数分得出两种做法。
+//   臂 C（回收开 + 严格池上限，每池 64 组，C66 的包装器）：一段 150 次派发，被拒 ≥ 1 次、增长池 ≥ 2 个、150 组全从回收表交出、输出全对。
+//   臂 D（回收开 + 一批放不进空池）：改成一组一组分（输出全对、第 2 轮起新分 0、不标 dead）。
+//   臂 E（回收开 + 一组也放不进空池）：布局标 dead、回到老路径（输出全对、驱动里每轮 +70），增长池始终 1 个（不会每次都建新池）。
+//   臂 F（生产缺省）：回收期望开着；稳态新分 0。缺省改成关的时候这里会红，改动要在 PR 里讲清。
+//   臂 G（回收的组里留着上一次的描述符 → 写法不同的取用不用回收来的组）：布局有两项（binding 0 / 1），着色器只用 binding 0。
+//                   段 1 写法 {binding 0, binding 1}（槽 1 指向缓冲 Y）：新分 1 组（批大小从 1 起）、表项的写法定为它；释放 Y（完成线程在不确定的时刻销毁它）；
+//                   段 2 写法 {binding 0}（和表项的不同）：不从表项取（复用 0、交出 0、被拒 1），走老路径（驱动里分配计数 +1），输出全对；
+//                   段 3 写法又是 {0, 1}（槽 1 指向新缓冲）：照常复用 1、被拒 0、新分 0；
+//                   竞态 40 轮：每轮「写法 {0, 1} 的段 → 立刻释放它的缓冲 → 写法 {0} 的段」：复用 40、被拒 40、新分 0、老路径 +40、输出全对，两条恒等式成立。
+//                   旧做法（表项里的组留着没重写的槽）下，被销毁的 Y 还被已绑进下一段的组指着：validation 层报 VUID-vkDestroyBuffer-buffer-00922
+//                   或命令缓冲因「绑定的缓冲已销毁」失效，整套 vk 用例里偶发（本臂 40 轮就是为了让它每遍都有很多次机会撞上）。
+//   臂 M（写法按「binding + 数组项号」认）：布局 binding 0 有 3 项、binding 1 有 2 项，每段在 binding 0 第 0 项之外再多写一条：
+//                   {b0e0, b0e1} 定写法并新分 1 组；{b0e0, b0e2}（条数、binding 相同，数组项号不同）、{b0e0, b1e1}（条数、数组项号的集合相同，binding 不同）、
+//                   {b0e0}（条数不同）各被拒 1 次、复用 0；回到 {b0e0, b0e1} 照常复用 1。两条恒等式成立。
+//   臂 H（空闲串上限）：① 300 轮稳态（N = 70，中间滚过一格窗口）不清扫、新分始终 71（上限不抖动）；
+//                   ② 一次 300 次派发的突发（先取空闲的 71 组，再要 29 批 8 组：空闲 303）后跟 520 个一次派发的小段，滚过两格窗口：清扫还池 303 - 18 = 285、空闲 18；
+//                   再来一次突发，补分 ≥ 282、输出全对；全程每格窗口里这个表项都被取过：没有表项变冷。
+//   臂 I（取组碰锁）：测试线程自己持着回收表的锁，一段 10 次派发的取组全部退回老路径：碰锁 10 次、回收表交出 0、驱动里分配计数 +10、输出全对。
+//   臂 J（表项登记在管线里，生产缺省）：同一条管线连跑 4 轮（N = 70）：表项只在第 1 轮第一次取组时登记 1 项，第 2…4 轮 0 项；放弃的段也是 0 项；
+//                   换一条布局不同的管线（两项布局）：再登记 1 项，之后 0 项；输出全对、两条恒等式成立；会话代际比上一个臂的大（每次开会话 +1）。
+//   臂 K（登记表随管线数涨，没有上限）：40 条各有自己布局的管线（布局项数 1 / 2 交替），每条各跑 5 轮、每轮 3 次派发：表项数 = 管线数 40、没有重复登记（第 2…5 轮不涨）、
+//                   每条管线只向驱动要过 1 + 2 = 3 组（批大小 1、2，之后 3 组刚好够用）、沿登记表遍历数出来的表项数 == 登记的计数（链表没丢项）、输出全对、
+//                   两条恒等式成立（空闲数是遍历出来的：丢了项恒等式就对不上）。
+//   臂 L（登记时内存不够）：注入 70 次登记失败：第 1 轮取组全部退回老路径（驱动里每轮分配计数 +70、回收表交出 0、表项数 0、输出全对）；
+//                   失败不记：第 2 轮登记成功、走回收表（交出 70、表项数 1、新分 71），第 3 轮起稳态新分 0，两条恒等式成立。
+//   臂 N（冷表项整串收回）：同一布局的两条管线 A、B（各一个表项）。B 先跑 1 轮 70 次派发（新分 71、空闲 71），之后只让 A 每轮 1 次派发地跑，按清扫滚过的格数核对：
+//                   第 1 格里 B 被用过（不清扫）；第 2 次清扫时 B 已一格没人碰：空闲串压到 2 × 0 + 16 = 16（清扫还池 55）、还没变冷；
+//                   B 在第 3 格里又被取 1 次（复用、不新分）：第 3 次清扫不清扫、冷计数归零；第 4 次清扫 B 又一格没人碰：冷计数只到 1，不收（「连续」两格才算冷，累计不算）；
+//                   第 5 次清扫 B 连续两格没人碰：整串还给池（累计清扫还池 71）、变冷 1 次、手里攥着空闲串数组的表项只剩 A、最近一格被取过的表项 1 个（A）；
+//                   B 再跑 1 轮 70 次派发：新分 71（批大小归零后从 1 起翻倍，和第 1 轮一样；批大小要是没归零，这一轮会是 72）、输出全对、两条恒等式成立。
+#define C204_SLOTS 320
+#define C204_EQ(what, got, want) CHECK((got) == (want), "C204 臂 %c " what "：期望 %llu → %llu", 'A' + arm, (unsigned long long)(want), (unsigned long long)(got))
+struct c204_snap { uint64_t nw, reuse, put, freed, trimmed, taken, idle, pools, dead, busy, sigmiss; unsigned drv; };
+static struct c204_snap c204_now(void) {
+    struct c204_snap s;
+    s.nw = nvn_vk_dbg_dset_stat(0); s.reuse = nvn_vk_dbg_dset_stat(1); s.put = nvn_vk_dbg_dset_stat(2); s.freed = nvn_vk_dbg_dset_stat(3);
+    s.taken = nvn_vk_dbg_dset_stat(4); s.idle = nvn_vk_dbg_dset_stat(5); s.pools = nvn_vk_dbg_dset_stat(7); s.dead = nvn_vk_dbg_dset_stat(8);
+    s.trimmed = nvn_vk_dbg_dset_stat(10); s.busy = nvn_vk_dbg_dset_stat(11); s.sigmiss = nvn_vk_dbg_dset_stat(14);
+    s.drv = g_desc_sets_total;
+    return s;
+}
+// 段完成的收尾（把组放回）在完成线程里、晚于 fence_wait 返回：等到交出去的组都有了着落（放回或还给池）再进下一轮（最多 5 秒）
+static void c204_settle(void) {
+    for (int i = 0; i < 5000; i++) {
+        if (nvn_vk_dbg_dset_stat(4) == nvn_vk_dbg_dset_stat(2) + nvn_vk_dbg_dset_stat(3)) return;
+        struct timespec ts = {0, 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+// 一轮：缓冲清零 → 一段里连发 n 次派发（每次换偏移 → 每次一个新组）→ 提交并等完成（abandon 时改为放弃这一段）→ 逐槽核对输出。返回不符的槽数。
+// extra != NULL：这一段在 binding 0 的第 0 项之外再多写一条（布局项 xent 的数组项 xelem，指向 extra），这一笔的「写法」就多一条。
+static int c204_round_x(nvn_gpu_pipe cp, nvn_gpu_buf buf, nvn_gpu_buf extra, uint32_t xent, uint32_t xelem, uint64_t stride, int n, int abandon, uint64_t *sig, const char *tag) {
+    memset(buf_cpu(buf), 0, (size_t)(stride * C204_SLOTS));
+    nvn_gpu_cmd c = begin_cmd();
+    nvn_gpu_set_pipe(c, cp);
+    nvn_gpu_binding bs[2];   // nvn_gpu_bind 一次给齐本阶段的全部绑定（每次调用整表替换），所以多出的一条要和第一条放在同一张表里
+    memset(bs, 0, sizeof bs);
+    bs[0].ent = 0; bs[0].cls = NVN_GPU_RES_SSBO; bs[0].u.b.buf = buf; bs[0].u.b.len = 64;
+    bs[1] = bs[0]; bs[1].ent = xent; bs[1].elem = xelem; bs[1].u.b.buf = extra; bs[1].u.b.off = 0; bs[1].u.b.len = 64;
+    for (int i = 0; i < n; i++) {
+        bs[0].u.b.off = (uint64_t)i * stride; nvn_gpu_bind(c, NVN_GPU_SH_CS, bs, extra ? 2 : 1);
+        nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0);
+    }
+    if (abandon) { nvn_gpu_cmd_abort(c); c204_settle(); return 0; }
+    nvn_gpu_err e;
+    nvn_gpu_rc r = nvn_gpu_cmd_commit(c, ++*sig, on_done, NULL, &e);
+    CHECK(OK(r), "C204 %s commit：%d %s", tag, r.code, e.why);
+    r = nvn_gpu_fence_wait(*sig, 5000000000ull, &e);
+    CHECK(OK(r), "C204 %s wait：%d %s", tag, r.code, e.why);
+    c204_settle();
+    int bad = 0;
+    for (int k = 0; k < n; k++) {
+        const uint32_t *v = (const uint32_t *)(buf_cpu(buf) + k * stride);
+        for (int i = 0; i < 16; i++) if (v[i] != (uint32_t)i + 1) { bad++; break; }
+    }
+    return bad;
+}
+static int c204_round(nvn_gpu_pipe cp, nvn_gpu_buf buf, uint64_t stride, int n, int abandon, uint64_t *sig, const char *tag) {
+    return c204_round_x(cp, buf, NULL, 0, 0, stride, n, abandon, sig, tag);
+}
+// 让 cp 每轮 1 次派发地跑，直到清扫已滚过 want 格窗口（最多 2000 轮）；返回输出不符的槽数（臂 N 用）
+static int c204_roll_to(nvn_gpu_pipe cp, nvn_gpu_buf buf, uint64_t stride, uint64_t *sig, uint64_t want) {
+    int bad = 0;
+    for (int r = 0; r < 2000 && nvn_vk_dbg_dset_stat(12) < want; r++) bad += c204_round(cp, buf, stride, 1, 0, sig, "roll");
+    return bad;
+}
+static uint64_t g_c204_gen_prev;   // 上一个臂的会话代际（回收表代际每次开会话 +1，这里核对它确实在涨）
+static void c204_arm(const char *dir, int arm) {
+    g_dsetrec_flag = arm == 1 ? 0 : arm == 5 ? -2 : 1;
+    if (!open_backend()) { CHECK(0, "C204 臂 %c 开会话失败", 'A' + arm); g_dsetrec_flag = -1; return; }
+    { const uint64_t gen = nvn_vk_dbg_dset_stat(15);
+      CHECK(gen > g_c204_gen_prev, "C204 臂 %c 回收表代际应随每次开会话增大：上一个臂 %llu → 这个臂 %llu", 'A' + arm, (unsigned long long)g_c204_gen_prev, (unsigned long long)gen);
+      g_c204_gen_prev = gen; }
+    nvn_vk_dbg_dset_inject(arm == 3 ? 1 : arm == 4 ? 2 : 0);
+    if (arm == 11) nvn_vk_dbg_dset_failreg(70);   // 臂 L：接下来 70 次登记表项当作内存不够（第 1 轮 70 次取组各撞一次）
+    nvn_gpu_layout_ent ce[2];
+    memset(ce, 0, sizeof ce);
+    ce[0].set = 0; ce[0].cls = NVN_GPU_RES_SSBO; ce[0].access = NVN_GPU_ACC_W; ce[0].binding = 0; ce[0].count = 1; ce[0].stages = 1u << NVN_GPU_SH_CS;
+    ce[1] = ce[0]; ce[1].binding = 1;   // 臂 G / M：第二项，着色器不用
+    if (arm == 12) { ce[0].count = 3; ce[1].count = 2; }   // 臂 M：两项都是数组（3 项 / 2 项），着色器只用 binding 0 的第 0 项
+    nvn_gpu_layout cl;
+    memset(&cl, 0, sizeof cl);
+    cl.ent = ce; cl.nent = arm == 6 || arm == 12 ? 2 : 1;
+    nvn_gpu_shader sh = NULL;
+    nvn_gpu_pipe cp = mk_cpipe(dir, "comp.comp", &cl, &sh);
+    CHECK(cp != NULL, "C204 臂 %c cpipe 为空", 'A' + arm);
+    uint64_t stride = g_dev.properties.limits.minStorageBufferOffsetAlignment; if (stride < 64) stride = 64;
+    nvn_gpu_buf buf = cp ? make_buf(stride * C204_SLOTS, NVN_GPU_MEM_SHARED, NULL) : NULL;
+    uint64_t sig = 0;
+    struct c204_snap s0, s1;
+    int bad;
+    if (cp && buf) {
+        if (arm == 0) {
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "r1"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 A 第 1 轮输出不符 %d 槽", bad);
+            C204_EQ("第 1 轮向驱动新分的组（批大小 1、2、4、8 × 8 共 11 批）", s1.nw - s0.nw, 71); C204_EQ("第 1 轮复用（每批多出的组在本轮后面的派发里取：70 - 11）", s1.reuse - s0.reuse, 59);
+            C204_EQ("第 1 轮交出", s1.taken - s0.taken, 70); C204_EQ("第 1 轮放回", s1.put - s0.put, 70); C204_EQ("第 1 轮后空闲串", s1.idle, 71);
+            for (int r = 2; r <= 6; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "steady"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 A 第 %d 轮输出不符 %d 槽", r, bad);
+                CHECK(s1.nw == s0.nw && s1.drv == s0.drv, "C204 臂 A 第 %d 轮：向驱动新分的组期望 0（驱动计数 +0）→ %llu（驱动计数 +%u）", r, (unsigned long long)(s1.nw - s0.nw), s1.drv - s0.drv);
+                CHECK(s1.reuse - s0.reuse == 70 && s1.put - s0.put == 70 && s1.idle == 71, "C204 臂 A 第 %d 轮：复用 70、放回 70、空闲 71，实为 %llu / %llu / %llu", r,
+                      (unsigned long long)(s1.reuse - s0.reuse), (unsigned long long)(s1.put - s0.put), (unsigned long long)s1.idle);
+            }
+            s0 = c204_now(); (void)c204_round(cp, buf, stride, 70, 1, &sig, "abandon"); s1 = c204_now();
+            C204_EQ("放弃的段：复用", s1.reuse - s0.reuse, 70); C204_EQ("放弃的段：放回", s1.put - s0.put, 0);
+            C204_EQ("放弃的段：还给池", s1.freed - s0.freed, 70); C204_EQ("放弃之后的空闲串", s1.idle, 1);
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "refill"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 A 放弃之后第 1 轮输出不符 %d 槽", bad);
+            C204_EQ("放弃之后补分（取走空闲的 1 组，再要 9 批 8 组）", s1.nw - s0.nw, 72);
+            for (int r = 0; r < 2; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "steady2"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 A 放弃之后稳态输出不符 %d 槽", bad);
+                CHECK(s1.nw == s0.nw && s1.drv == s0.drv, "C204 臂 A 放弃之后稳态：向驱动新分的组期望 0 → %llu", (unsigned long long)(s1.nw - s0.nw));
+            }
+            s1 = c204_now();
+            CHECK(s1.taken == s1.put + s1.freed, "C204 臂 A 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+            CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 A 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+            C204_EQ("取组碰锁退回老路径的次数", s1.busy, 0);
+        } else if (arm == 1) {
+            for (int r = 1; r <= 3; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "off"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 B 第 %d 轮输出不符 %d 槽", r, bad);
+                C204_EQ("回收关：每轮驱动里的分配计数增量", (uint64_t)(s1.drv - s0.drv), 70);
+                CHECK(s1.nw == 0 && s1.taken == 0 && s1.reuse == 0 && s1.idle == 0 && s1.pools == 0, "C204 臂 B 回收表的计数应全程为 0：新分 %llu 交出 %llu 复用 %llu 空闲 %llu 池 %llu",
+                      (unsigned long long)s1.nw, (unsigned long long)s1.taken, (unsigned long long)s1.reuse, (unsigned long long)s1.idle, (unsigned long long)s1.pools);
+            }
+        } else if (arm == 2) {
+            g_c66_sets_requested = g_c66_rejects = 0; g_c66_pool = VK_NULL_HANDLE; g_c66_inject_pool_limit = 1;
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 150, 0, &sig, "limit"); s1 = c204_now();
+            g_c66_inject_pool_limit = 0;
+            CHECK(bad == 0, "C204 臂 C 输出不符 %d 槽", bad);
+            CHECK(g_c66_rejects >= 1, "C204 臂 C 严格池上限：被拒期望 ≥ 1 次 → %u 次", g_c66_rejects);
+            CHECK(s1.pools - s0.pools >= 2, "C204 臂 C 增长池期望 ≥ 2 个 → %llu 个", (unsigned long long)(s1.pools - s0.pools));
+            C204_EQ("150 组全从回收表交出", s1.taken - s0.taken, 150);
+        } else if (arm == 3) {
+            for (int r = 1; r <= 3; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "solo"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 D 第 %d 轮输出不符 %d 槽", r, bad);
+                if (r == 1) C204_EQ("一批放不进空池：第 1 轮改一组一组分，新分", s1.nw - s0.nw, 70);
+                else C204_EQ("一批放不进空池：稳态新分", s1.nw - s0.nw, 0);
+                C204_EQ("一批放不进空池：不标 dead", s1.dead, 0);
+            }
+        } else if (arm == 4) {
+            for (int r = 1; r <= 3; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "dead"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 E 第 %d 轮输出不符 %d 槽", r, bad);
+                C204_EQ("一组也放不进空池：回到老路径，驱动里每轮分配计数增量", (uint64_t)(s1.drv - s0.drv), 70);
+                C204_EQ("一组也放不进空池：标 dead 的布局数", s1.dead, 1);
+                C204_EQ("一组也放不进空池：增长池始终", s1.pools, 1);
+                C204_EQ("一组也放不进空池：回收表交出", s1.taken, 0);
+            }
+        } else if (arm == 5) {
+            C204_EQ("生产缺省：回收是否开着", nvn_vk_dbg_dset_stat(9), 1);
+            for (int r = 1; r <= 3; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "default"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 F 第 %d 轮输出不符 %d 槽", r, bad);
+                if (r == 3) C204_EQ("生产缺省：稳态新分", s1.nw - s0.nw, 0);
+            }
+        } else if (arm == 6) {
+            nvn_gpu_buf y = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+            if (y) {
+                s0 = c204_now(); bad = c204_round_x(cp, buf, y, 1, 0, stride, 1, 0, &sig, "pat-ab"); s1 = c204_now();   // 写法 {binding 0, binding 1}：表项的写法定为它；槽 1 指向缓冲 Y
+                CHECK(bad == 0, "C204 臂 G 段 1 输出不符 %d 槽", bad);
+                C204_EQ("段 1 向驱动新分的组（批大小从 1 起）", s1.nw - s0.nw, 1); C204_EQ("段 1 写法被拒的次数（第一次定写法，不拒）", s1.sigmiss - s0.sigmiss, 0);
+                nvn_gpu_buf_release(y, NULL, NULL);   // Y 由完成线程在不确定的时刻销毁；表项里的组都写过槽 1，那里还指着 Y
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 1, 0, &sig, "pat-a"); s1 = c204_now();   // 写法 {binding 0}：和表项的不同
+                CHECK(bad == 0, "C204 臂 G 段 2 输出不符 %d 槽", bad);
+                C204_EQ("段 2 写法不同：不从表项取（复用）", s1.reuse - s0.reuse, 0); C204_EQ("段 2 写法不同：交出", s1.taken - s0.taken, 0);
+                C204_EQ("段 2 写法不同：被拒", s1.sigmiss - s0.sigmiss, 1);
+                C204_EQ("段 2 写法不同：走老路径，驱动里分配计数增量", (uint64_t)(s1.drv - s0.drv), 1);
+                nvn_gpu_buf y2 = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+                if (y2) {
+                    s0 = c204_now(); bad = c204_round_x(cp, buf, y2, 1, 0, stride, 1, 0, &sig, "pat-ab2"); s1 = c204_now();   // 写法又是 {0, 1}：照常复用（所有槽都重写）
+                    CHECK(bad == 0, "C204 臂 G 段 3 输出不符 %d 槽", bad);
+                    C204_EQ("段 3 写法相同：复用", s1.reuse - s0.reuse, 1); C204_EQ("段 3 写法相同：被拒", s1.sigmiss - s0.sigmiss, 0); C204_EQ("段 3 写法相同：新分", s1.nw - s0.nw, 0);
+                    nvn_gpu_buf_release(y2, NULL, NULL);
+                }
+                // 竞态的读数：每一轮「写法 {0, 1} 的段（槽 1 指向新缓冲）→ 立刻释放那个缓冲 → 写法 {0} 的段」。缓冲由完成线程异步销毁，
+                // 销毁可能落在下一段录制 / 执行的任何时刻；旧做法（回收的组里留着槽 1）下 validation 层会按 VUID-vkDestroyBuffer-buffer-00922 或命令缓冲失效报错，
+                // 现在写法不同的段不碰表项里的组，一次都不该报（validation 报错由 run.sh 逐遍统计）。
+                s0 = c204_now();
+                for (int r = 0; r < 40; r++) {
+                    nvn_gpu_buf yr = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+                    if (!yr) { CHECK(0, "C204 臂 G 竞态第 %d 轮建缓冲失败", r); break; }
+                    bad = c204_round_x(cp, buf, yr, 1, 0, stride, 1, 0, &sig, "race-ab");
+                    nvn_gpu_buf_release(yr, NULL, NULL);
+                    bad += c204_round(cp, buf, stride, 1, 0, &sig, "race-a");
+                    if (bad) { CHECK(0, "C204 臂 G 竞态第 %d 轮输出不符 %d 槽", r, bad); break; }
+                }
+                s1 = c204_now();
+                C204_EQ("竞态 40 轮：写法 {0, 1} 的段复用", s1.reuse - s0.reuse, 40); C204_EQ("竞态 40 轮：写法 {0} 的段被拒", s1.sigmiss - s0.sigmiss, 40);
+                C204_EQ("竞态 40 轮：向驱动新分的组", s1.nw - s0.nw, 0); C204_EQ("竞态 40 轮：老路径的驱动分配计数增量", (uint64_t)(s1.drv - s0.drv), 40);
+                CHECK(s1.taken == s1.put + s1.freed, "C204 臂 G 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+                CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 G 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+            }
+        } else if (arm == 12) {
+            // 臂 M：写法按「binding + 数组项号」认，数一样也算不同。布局 binding 0 有 3 项、binding 1 有 2 项；每段在 binding 0 第 0 项之外再多写一条。
+            nvn_gpu_buf y = make_buf(64, NVN_GPU_MEM_SHARED, NULL);
+            if (y) {
+                s0 = c204_now(); bad = c204_round_x(cp, buf, y, 0, 1, stride, 1, 0, &sig, "m-b0e1"); s1 = c204_now();   // 写法 {b0e0, b0e1}：表项的写法定为它
+                CHECK(bad == 0, "C204 臂 M 段 1 输出不符 %d 槽", bad);
+                C204_EQ("段 1 向驱动新分的组（批大小从 1 起）", s1.nw - s0.nw, 1); C204_EQ("段 1 被拒", s1.sigmiss - s0.sigmiss, 0);
+                s0 = c204_now(); bad = c204_round_x(cp, buf, y, 0, 2, stride, 1, 0, &sig, "m-b0e2"); s1 = c204_now();   // {b0e0, b0e2}：条数相同、binding 相同，数组项号不同
+                CHECK(bad == 0, "C204 臂 M 段 2 输出不符 %d 槽", bad);
+                C204_EQ("段 2 数组项号不同：复用", s1.reuse - s0.reuse, 0); C204_EQ("段 2 数组项号不同：被拒", s1.sigmiss - s0.sigmiss, 1);
+                s0 = c204_now(); bad = c204_round_x(cp, buf, y, 1, 1, stride, 1, 0, &sig, "m-b1e1"); s1 = c204_now();   // {b0e0, b1e1}：条数相同、数组项号的集合相同，binding 不同
+                CHECK(bad == 0, "C204 臂 M 段 3 输出不符 %d 槽", bad);
+                C204_EQ("段 3 binding 不同：复用", s1.reuse - s0.reuse, 0); C204_EQ("段 3 binding 不同：被拒", s1.sigmiss - s0.sigmiss, 1);
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 1, 0, &sig, "m-b0e0"); s1 = c204_now();   // {b0e0}：条数不同
+                CHECK(bad == 0, "C204 臂 M 段 4 输出不符 %d 槽", bad);
+                C204_EQ("段 4 条数不同：复用", s1.reuse - s0.reuse, 0); C204_EQ("段 4 条数不同：被拒", s1.sigmiss - s0.sigmiss, 1);
+                s0 = c204_now(); bad = c204_round_x(cp, buf, y, 0, 1, stride, 1, 0, &sig, "m-b0e1-again"); s1 = c204_now();   // 回到 {b0e0, b0e1}：照常复用
+                CHECK(bad == 0, "C204 臂 M 段 5 输出不符 %d 槽", bad);
+                C204_EQ("段 5 写法相同：复用", s1.reuse - s0.reuse, 1); C204_EQ("段 5 写法相同：被拒", s1.sigmiss - s0.sigmiss, 0);
+                nvn_gpu_buf_release(y, NULL, NULL);
+                s1 = c204_now();
+                CHECK(s1.taken == s1.put + s1.freed, "C204 臂 M 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+                CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 M 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+            }
+        } else if (arm == 13) {
+            // 臂 N：冷表项整串收回（见上面的说明）。A = cp，B = 同一布局的另一条管线（各有自己的布局句柄、自己的表项）。
+            nvn_gpu_shader shb = NULL;
+            nvn_gpu_pipe cpb = mk_cpipe(dir, "comp.comp", &cl, &shb);
+            CHECK(cpb != NULL, "C204 臂 N 第二条管线为空");
+            if (cpb) {
+                s0 = c204_now(); bad = c204_round(cpb, buf, stride, 70, 0, &sig, "n-b1"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 N B 第 1 轮输出不符 %d 槽", bad);
+                C204_EQ("B 第 1 轮新分", s1.nw - s0.nw, 71); C204_EQ("B 第 1 轮后空闲串", s1.idle, 71);
+                C204_EQ("B 第 1 轮后手里攥着空闲串数组的表项", nvn_vk_dbg_dset_stat(18), 1);
+                bad = c204_roll_to(cp, buf, stride, &sig, 2);   // A 每轮 1 次派发地跑到清扫滚过 2 格：第 2 次清扫时 B 已一格没人碰
+                CHECK(bad == 0, "C204 臂 N A 输出不符 %d 槽", bad);
+                s1 = c204_now();
+                C204_EQ("清扫滚过的格数", nvn_vk_dbg_dset_stat(12), 2);
+                C204_EQ("第 2 次清扫（B 一格没人碰）：B 的空闲串压到 16（清扫还池 71 - 16）", s1.trimmed, 55);
+                C204_EQ("第 2 次清扫：还没有表项变冷", nvn_vk_dbg_dset_stat(17), 0);
+                s0 = c204_now(); bad = c204_round(cpb, buf, stride, 1, 0, &sig, "n-b-again"); s1 = c204_now();   // B 在第 3 格窗口里又被取了 1 次：冷计数归零（要「连续」两格才算冷）
+                CHECK(bad == 0, "C204 臂 N B 再取 1 次输出不符 %d 槽", bad);
+                C204_EQ("B 再取 1 次：从空闲串复用", s1.reuse - s0.reuse, 1); C204_EQ("B 再取 1 次：新分", s1.nw - s0.nw, 0);
+                bad = c204_roll_to(cp, buf, stride, &sig, 3);
+                CHECK(bad == 0, "C204 臂 N A 输出不符 %d 槽", bad);
+                s1 = c204_now();
+                C204_EQ("第 3 次清扫（B 这一格被取过）：不再清扫", s1.trimmed, 55); C204_EQ("第 3 次清扫：没有表项变冷", nvn_vk_dbg_dset_stat(17), 0);
+                bad = c204_roll_to(cp, buf, stride, &sig, 4);
+                CHECK(bad == 0, "C204 臂 N A 输出不符 %d 槽", bad);
+                s1 = c204_now();
+                C204_EQ("第 4 次清扫（B 又一格没人碰，冷计数从 0 起只到 1）：不收", s1.trimmed, 55); C204_EQ("第 4 次清扫：没有表项变冷", nvn_vk_dbg_dset_stat(17), 0);
+                bad = c204_roll_to(cp, buf, stride, &sig, 5);
+                CHECK(bad == 0, "C204 臂 N A 输出不符 %d 槽", bad);
+                s1 = c204_now();
+                C204_EQ("清扫滚过的格数", nvn_vk_dbg_dset_stat(12), 5);
+                C204_EQ("第 5 次清扫（B 连续两格没人碰）：B 整串还给池（累计清扫还池 55 + 16）", s1.trimmed, 71);
+                C204_EQ("第 5 次清扫：变冷的表项次数", nvn_vk_dbg_dset_stat(17), 1);
+                C204_EQ("第 5 次清扫：空闲串里只剩 A 的 1 组", s1.idle, 1);
+                C204_EQ("第 5 次清扫：手里攥着空闲串数组的表项只剩 A", nvn_vk_dbg_dset_stat(18), 1);
+                C204_EQ("第 5 次清扫：最近一格里被取过的表项（A）", nvn_vk_dbg_dset_stat(16), 1);
+                s0 = c204_now(); bad = c204_round(cpb, buf, stride, 70, 0, &sig, "n-b2"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 N B 第 2 轮输出不符 %d 槽", bad);
+                C204_EQ("B 变冷收回后再用：新分（批大小归零，从 1 起翻倍，和第 1 轮一样）", s1.nw - s0.nw, 71);
+                C204_EQ("B 变冷收回后再用：交出", s1.taken - s0.taken, 70);
+                s1 = c204_now();
+                CHECK(s1.taken == s1.put + s1.freed, "C204 臂 N 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+                CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 N 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+            }
+            if (shb) nvn_gpu_shader_release(shb);
+        } else if (arm == 7) {
+            s0 = c204_now();
+            for (int r = 0; r < 300; r++) {
+                bad = c204_round(cp, buf, stride, 70, 0, &sig, "h1");
+                if (bad) { CHECK(0, "C204 臂 H ① 第 %d 轮输出不符 %d 槽", r, bad); break; }
+            }
+            s1 = c204_now();
+            C204_EQ("① 300 轮稳态向驱动新分的组（上限不抖动）", s1.nw - s0.nw, 71); C204_EQ("① 300 轮稳态清扫还池", s1.trimmed - s0.trimmed, 0);
+            C204_EQ("① 清扫窗口已滚过的格数（300 个段 / 256）", nvn_vk_dbg_dset_stat(12), 1);
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 300, 0, &sig, "h2burst"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 H ② 突发输出不符 %d 槽", bad);
+            C204_EQ("② 突发后空闲串（先取空闲的 71 组，再要 29 批 8 组）", s1.idle, 303);
+            for (int r = 0; r < 520; r++) {
+                bad = c204_round(cp, buf, stride, 1, 0, &sig, "h2small");
+                if (bad) { CHECK(0, "C204 臂 H ② 小段第 %d 轮输出不符 %d 槽", r, bad); break; }
+            }
+            s1 = c204_now();
+            C204_EQ("② 小段滚过两格窗口后空闲串（2 × 峰值 1 + 16）", s1.idle, 18);
+            C204_EQ("② 清扫还池的组（303 - 18）", s1.trimmed, 285);
+            C204_EQ("② 全程每格窗口里这个表项都被取过：没有表项变冷", nvn_vk_dbg_dset_stat(17), 0);
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 300, 0, &sig, "h2again"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 H ② 再次突发输出不符 %d 槽", bad);
+            CHECK(s1.nw - s0.nw >= 282 && s1.nw - s0.nw <= 289, "C204 臂 H ② 再次突发补分：期望 282…289 组 → %llu", (unsigned long long)(s1.nw - s0.nw));
+            s1 = c204_now();
+            CHECK(s1.taken == s1.put + s1.freed, "C204 臂 H 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+            CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 H 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+        } else if (arm == 9) {
+            uint64_t k0 = nvn_vk_dbg_dset_stat(6);
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "j1"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 J 第 1 轮输出不符 %d 槽", bad);
+            C204_EQ("第 1 轮登记的表项（只有第一次取组要登记）", nvn_vk_dbg_dset_stat(6) - k0, 1);
+            C204_EQ("第 1 轮交出", s1.taken - s0.taken, 70); C204_EQ("第 1 轮放回", s1.put - s0.put, 70);
+            for (int r = 2; r <= 4; r++) {
+                k0 = nvn_vk_dbg_dset_stat(6); s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "j-steady"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 J 第 %d 轮输出不符 %d 槽", r, bad);
+                C204_EQ("稳态每轮登记的表项", nvn_vk_dbg_dset_stat(6) - k0, 0);
+                CHECK(s1.reuse - s0.reuse == 70 && s1.put - s0.put == 70 && s1.nw == s0.nw, "C204 臂 J 第 %d 轮：复用 70、放回 70、新分 0，实为 %llu / %llu / %llu", r,
+                      (unsigned long long)(s1.reuse - s0.reuse), (unsigned long long)(s1.put - s0.put), (unsigned long long)(s1.nw - s0.nw));
+            }
+            k0 = nvn_vk_dbg_dset_stat(6); (void)c204_round(cp, buf, stride, 70, 1, &sig, "j-abandon");
+            C204_EQ("放弃的段登记的表项", nvn_vk_dbg_dset_stat(6) - k0, 0);
+            bad = c204_round(cp, buf, stride, 70, 0, &sig, "j-after-abandon");
+            CHECK(bad == 0, "C204 臂 J 放弃之后输出不符 %d 槽", bad);
+            nvn_gpu_layout_ent ce2[2]; memset(ce2, 0, sizeof ce2);   // 另一条布局不同（两项）的管线：自己的布局句柄、自己的表项
+            ce2[0].set = 0; ce2[0].cls = NVN_GPU_RES_SSBO; ce2[0].access = NVN_GPU_ACC_W; ce2[0].binding = 0; ce2[0].count = 1; ce2[0].stages = 1u << NVN_GPU_SH_CS;
+            ce2[1] = ce2[0]; ce2[1].binding = 1;
+            nvn_gpu_layout cl2; memset(&cl2, 0, sizeof cl2); cl2.ent = ce2; cl2.nent = 2;
+            nvn_gpu_shader sh2 = NULL; nvn_gpu_pipe cp2 = mk_cpipe(dir, "comp.comp", &cl2, &sh2);
+            CHECK(cp2 != NULL, "C204 臂 J 第二条管线为空");
+            if (cp2) {
+                k0 = nvn_vk_dbg_dset_stat(6); bad = c204_round(cp2, buf, stride, 70, 0, &sig, "j2-1");
+                CHECK(bad == 0, "C204 臂 J 第二条管线第 1 轮输出不符 %d 槽", bad);
+                C204_EQ("第二条管线第 1 轮登记的表项", nvn_vk_dbg_dset_stat(6) - k0, 1);
+                k0 = nvn_vk_dbg_dset_stat(6); bad = c204_round(cp2, buf, stride, 70, 0, &sig, "j2-2");
+                CHECK(bad == 0, "C204 臂 J 第二条管线第 2 轮输出不符 %d 槽", bad);
+                C204_EQ("第二条管线稳态登记的表项", nvn_vk_dbg_dset_stat(6) - k0, 0);
+                C204_EQ("两条管线 = 两个表项", nvn_vk_dbg_dset_stat(6), 2);
+            }
+            if (sh2) nvn_gpu_shader_release(sh2);
+            s1 = c204_now();
+            CHECK(s1.taken == s1.put + s1.freed, "C204 臂 J 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+            CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 J 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+        } else if (arm == 10) {
+            enum { NP = 40 };   // 管线条数：比 DSET 的任何常数都大，链表头插 40 次，丢项会让遍历数少于登记数
+            nvn_gpu_shader shs[NP]; nvn_gpu_pipe cps[NP]; nvn_gpu_layout cls[NP]; nvn_gpu_layout_ent ces[NP][2];
+            memset(shs, 0, sizeof shs); memset(cps, 0, sizeof cps); memset(cls, 0, sizeof cls); memset(ces, 0, sizeof ces);
+            int made = 0;
+            for (int i = 0; i < NP; i++) {
+                ces[i][0] = ce[0]; ces[i][1] = ce[1];
+                cls[i].ent = ces[i]; cls[i].nent = 1 + (uint32_t)(i & 1);   // 布局项数 1 / 2 交替：每条管线仍各有自己的布局句柄
+                cps[i] = mk_cpipe(dir, "comp.comp", &cls[i], &shs[i]);
+                if (cps[i]) made++;
+            }
+            C204_EQ("40 条管线都建出来了", (uint64_t)made, NP);
+            for (int r = 1; r <= 5; r++) {   // 5 轮、每轮取 3 组：第 1 轮每条管线要 1 + 2 = 3 组，之后刚好够用；放回错表项的毛病到第 2 轮就会让自己的空闲串见底、被迫再向驱动要组
+                const uint64_t t0 = nvn_vk_dbg_dset_stat(6);
+                int badn = 0;
+                for (int i = 0; i < NP; i++) if (cps[i]) badn += c204_round(cps[i], buf, stride, 3, 0, &sig, "k") != 0;
+                CHECK(badn == 0, "C204 臂 K 第 %d 轮：%d 条管线输出不符", r, badn);
+                if (r == 1) C204_EQ("第 1 轮登记的表项（每条管线 1 项）", nvn_vk_dbg_dset_stat(6) - t0, NP);
+                else C204_EQ("稳态每轮登记的表项（不重复登记）", nvn_vk_dbg_dset_stat(6) - t0, 0);
+            }
+            C204_EQ("表项数 = 管线数", nvn_vk_dbg_dset_stat(6), NP);
+            C204_EQ("沿登记表遍历数出的表项数 == 登记的计数（链表没丢项）", nvn_vk_dbg_dset_stat(13), nvn_vk_dbg_dset_stat(6));
+            s1 = c204_now();
+            C204_EQ("五轮、每条管线每轮 3 组：交出", s1.taken, 5 * 3 * NP); C204_EQ("五轮放回", s1.put, 5 * 3 * NP);
+            C204_EQ("每条管线只向驱动要过 3 组（批大小 1、2）", s1.nw, 3 * NP);
+            C204_EQ("遍历数出的空闲组 = 每条管线 3 组（丢项会少）", s1.idle, 3 * NP);
+            CHECK(s1.taken == s1.put + s1.freed, "C204 臂 K 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+            CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 K 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+            for (int i = 0; i < NP; i++) if (shs[i]) nvn_gpu_shader_release(shs[i]);
+        } else if (arm == 11) {
+            // 臂 L 开会话后注入了 70 次登记失败（c204_arm）：第 1 轮 70 次取组各撞上一次，全部退回老路径
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "l1"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 L 第 1 轮输出不符 %d 槽", bad);
+            C204_EQ("登记失败：回收表交出", s1.taken - s0.taken, 0);
+            C204_EQ("登记失败：驱动里每轮分配计数增量（老路径一组一次）", (uint64_t)(s1.drv - s0.drv), 70);
+            C204_EQ("登记失败：表项数", nvn_vk_dbg_dset_stat(6), 0);
+            C204_EQ("登记失败：新分", s1.nw - s0.nw, 0);
+            s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "l2"); s1 = c204_now();
+            CHECK(bad == 0, "C204 臂 L 第 2 轮输出不符 %d 槽", bad);
+            C204_EQ("失败不记：第 2 轮登记成功、走回收表，交出", s1.taken - s0.taken, 70); C204_EQ("失败不记：表项数", nvn_vk_dbg_dset_stat(6), 1);
+            C204_EQ("失败不记：第 2 轮向驱动要 11 批 71 组", s1.nw - s0.nw, 71);
+            for (int r = 3; r <= 4; r++) {
+                s0 = c204_now(); bad = c204_round(cp, buf, stride, 70, 0, &sig, "l-steady"); s1 = c204_now();
+                CHECK(bad == 0, "C204 臂 L 第 %d 轮输出不符 %d 槽", r, bad);
+                CHECK(s1.nw == s0.nw && s1.reuse - s0.reuse == 70 && s1.put - s0.put == 70, "C204 臂 L 第 %d 轮：新分 0、复用 70、放回 70，实为 %llu / %llu / %llu", r,
+                      (unsigned long long)(s1.nw - s0.nw), (unsigned long long)(s1.reuse - s0.reuse), (unsigned long long)(s1.put - s0.put));
+            }
+            s1 = c204_now();
+            CHECK(s1.taken == s1.put + s1.freed, "C204 臂 L 恒等式 交出 == 放回 + 还给池：%llu == %llu + %llu", (unsigned long long)s1.taken, (unsigned long long)s1.put, (unsigned long long)s1.freed);
+            CHECK(s1.nw == s1.idle + s1.freed + s1.trimmed, "C204 臂 L 恒等式 向驱动要来的 == 空闲 + 还给池 + 清扫还池：%llu == %llu + %llu + %llu", (unsigned long long)s1.nw, (unsigned long long)s1.idle, (unsigned long long)s1.freed, (unsigned long long)s1.trimmed);
+        } else {
+            s0 = c204_now(); nvn_vk_dbg_dset_hold(1);
+            nvn_gpu_cmd c = begin_cmd();   // 不走 c204_round：持锁期间不能调用要锁的读数函数
+            nvn_gpu_set_pipe(c, cp);
+            nvn_gpu_binding b;
+            memset(&b, 0, sizeof b);
+            b.ent = 0; b.cls = NVN_GPU_RES_SSBO; b.u.b.buf = buf; b.u.b.len = 64;
+            memset(buf_cpu(buf), 0, (size_t)(stride * C204_SLOTS));
+            for (int i = 0; i < 10; i++) { b.u.b.off = (uint64_t)i * stride; nvn_gpu_bind(c, NVN_GPU_SH_CS, &b, 1); nvn_gpu_dispatch(c, cp, 1, 1, 1, NULL, 0); }
+            for (int w = 0; w < 5000 && nvn_vk_dbg_dset_stat(11) - s0.busy < 10; w++) { struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL); }   // nvk_dq 开着时取组在录制线程里异步发生：等 10 次碰锁都记上再放锁
+            const uint64_t busy_held = nvn_vk_dbg_dset_stat(11);
+            nvn_vk_dbg_dset_hold(0);
+            nvn_gpu_err e;
+            nvn_gpu_rc r = nvn_gpu_cmd_commit(c, ++sig, on_done, NULL, &e);
+            CHECK(OK(r), "C204 臂 I commit：%d %s", r.code, e.why);
+            r = nvn_gpu_fence_wait(sig, 5000000000ull, &e);
+            CHECK(OK(r), "C204 臂 I wait：%d %s", r.code, e.why);
+            c204_settle(); s1 = c204_now();
+            bad = 0;
+            for (int k = 0; k < 10; k++) { const uint32_t *v = (const uint32_t *)(buf_cpu(buf) + k * stride); for (int i = 0; i < 16; i++) if (v[i] != (uint32_t)i + 1) { bad++; break; } }
+            CHECK(bad == 0, "C204 臂 I 输出不符 %d 槽", bad);
+            C204_EQ("取组碰锁退回老路径的次数", busy_held - s0.busy, 10); C204_EQ("回收表交出", s1.taken - s0.taken, 0);
+            C204_EQ("碰锁退回老路径：驱动里分配计数增量", (uint64_t)(s1.drv - s0.drv), 10);
+        }
+    }
+    nvn_vk_dbg_dset_inject(0);
+    nvn_vk_dbg_dset_failreg(0);
+    if (buf) nvn_gpu_buf_release(buf, NULL, NULL);
+    if (sh) nvn_gpu_shader_release(sh);
+    nvn_gpu_err ce_close; memset(&ce_close, 0, sizeof ce_close);
+    CHECK(OK(nvn_gpu_close(5000000000ull, &ce_close)), "C204 臂 %c close：%d %s", 'A' + arm, ce_close.rc.code, ce_close.why);
+    CHECK(nvn_vk_dbg_dset_stat(7) == 0 && nvn_vk_dbg_dset_stat(5) == 0 && nvn_vk_dbg_dset_stat(6) == 0, "C204 臂 %c 收尾后增长池 / 空闲 / 布局表项期望全 0 → %llu / %llu / %llu", 'A' + arm,
+          (unsigned long long)nvn_vk_dbg_dset_stat(7), (unsigned long long)nvn_vk_dbg_dset_stat(5), (unsigned long long)nvn_vk_dbg_dset_stat(6));
+    g_dsetrec_flag = -1;
+}
+static void c204_dset_recycle(const char *dir) {
+    const char *only = getenv("S2A_TEST_C204_ARM");   // 调试：只跑某一个臂（A…N）
+    for (int arm = 0; arm < 14; arm++) if (!only || only[0] - 'A' == arm) c204_arm(dir, arm);
+    if (!only) printf("C204 描述符组按布局回收：A…N 十四个臂已核对\n");
 }
 
 // C67：origin_ll=1（NVN 窗口原点在左下）时后端不翻视口：这种约定下图是自下而上存的，行号 0 就是「下」，
@@ -5788,20 +6256,20 @@ static void c85_descriptor_reuse(const char *dir) {
             dyn.sc[0]=draw*4; nvn_gpu_set_dyn(c,&dyn); binds[0].u.view=draw==2?bv:rv;
             // 无效union字节不同不应影响同一种绑定身份。
             binds[0]._rsv=(uint8_t)draw;
-            nvn_gpu_bind(c,NVN_GPU_SH_FS,binds,2); unsigned before=g_desc_sets_total; nvn_gpu_draw(c,&da);
-            CHECK(g_desc_sets_total-before==(draw==0?2u:draw==1?0u:1u),"C85 段%d笔%d分配%u",seg,draw,g_desc_sets_total-before);
+            nvn_gpu_bind(c,NVN_GPU_SH_FS,binds,2); unsigned before=desc_demand(); nvn_gpu_draw(c,&da);
+            CHECK(desc_demand()-before==(draw==0?2u:draw==1?0u:1u),"C85 段%d笔%d分配%u",seg,draw,desc_demand()-before);
         }
         // 内部清除后所有组失效；重新发同绑定也必须重建两组。
         nvn_gpu_clear cl={0}; cl.color=0; cl.color_mask=0xf; cl.stencil_mask=0xff; cl.x=8; cl.w=4; cl.h=4; cl.value.f[1]=1; cl.value.f[3]=1;
         nvn_gpu_clear_rect(c,&cl); nvn_gpu_set_pipe(c,pipe); nvn_gpu_set_dyn(c,&dyn); nvn_gpu_set_vbuf(c,0,vb,0); nvn_gpu_bind(c,NVN_GPU_SH_FS,binds,2);
-        unsigned before=g_desc_sets_total; nvn_gpu_draw(c,&da); CHECK(g_memo_on || g_desc_sets_total-before==2,"C85 clear后重建两组");
-        nvn_gpu_set_pipe(c,pipe2); nvn_gpu_bind(c,NVN_GPU_SH_FS,binds,2); da.prim=5; before=g_desc_sets_total; nvn_gpu_draw(c,&da);
-        CHECK(g_desc_sets_total-before==2,"C85 layout换后重建两组");
+        unsigned before=desc_demand(); nvn_gpu_draw(c,&da); CHECK(g_memo_on || desc_demand()-before==2,"C85 clear后重建两组");
+        nvn_gpu_set_pipe(c,pipe2); nvn_gpu_bind(c,NVN_GPU_SH_FS,binds,2); da.prim=5; before=desc_demand(); nvn_gpu_draw(c,&da);
+        CHECK(desc_demand()-before==2,"C85 layout换后重建两组");
         // 旧 stage 绑定仍保留：无组管线必须忽略它们，回来后重建全部组。
-        nvn_gpu_set_pipe(c,no_sets); before=g_desc_sets_total; nvn_gpu_draw(c,&da);
-        CHECK(g_desc_sets_total==before,"C85 无组管线不分配");
-        nvn_gpu_set_pipe(c,pipe2); before=g_desc_sets_total; nvn_gpu_draw(c,&da);
-        CHECK(g_memo_on || g_desc_sets_total-before==2,"C85 有组→无组→有组重建两组");
+        nvn_gpu_set_pipe(c,no_sets); before=desc_demand(); nvn_gpu_draw(c,&da);
+        CHECK(desc_demand()==before,"C85 无组管线不分配");
+        nvn_gpu_set_pipe(c,pipe2); before=desc_demand(); nvn_gpu_draw(c,&da);
+        CHECK(g_memo_on || desc_demand()-before==2,"C85 有组→无组→有组重建两组");
         nvn_gpu_pass_end(c); nvn_gpu_copy_tex_buf(c,out,0,0,NULL,rb,0,48,192);
         CHECK(OK(nvn_gpu_cmd_commit(c,130+seg,on_done,NULL,&e)),"C85 commit %s",e.why); CHECK(OK(nvn_gpu_fence_wait(130+seg,5000000000ull,&e)),"C85 wait %s",e.why);
         const uint8_t *px=buf_cpu(rb); int bad=0; for(int y=0;y<4;y++)for(int x=0;x<12;x++){const uint8_t *v=px+(y*12+x)*4;if(v[0]!=(x<8?255:0)||v[1]||v[2]!=(x<8?0:255)||v[3]!=255)bad++;}
@@ -7907,6 +8375,13 @@ int main(int argc, char **argv) {
         s2a_vk_device_destroy(&g_dev, 1);
         return g_fail ? 1 : 0;
     }
+    if (getenv("S2A_TEST_C204_ONLY") && argc > 1) {   // 开发时只跑 C204（描述符组按布局回收；run.sh 不设这个变量）
+        memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
+        c204_dset_recycle(argv[1]);
+        printf("nvn_gpu Vulkan 后端 C204 单跑：%s（%d 处不符）\n", g_fail ? "红" : "绿", g_fail);
+        s2a_vk_device_destroy(&g_dev, 1);
+        return g_fail ? 1 : 0;
+    }
     if (getenv("S2A_TEST_C201_ONLY")) {   // 开发时只跑 C201（视图销毁的两处线性代价；run.sh 不设这个变量）
         memset(&g_desc, 0, sizeof g_desc); g_desc.host_device = &g_dev; g_desc.app_label = "nvn-backend-vk-test";
         if (!open_backend()) return 1;
@@ -8320,6 +8795,7 @@ int main(int argc, char **argv) {
     if (!open_backend()) return 1;   // C197 自己一个会话：围栏号从这里重新算，和前后用例不相干
     c197_pass_cache();
     CHECK(OK(nvn_gpu_close(5000000000ull, &e18)), "C197 close：%d %s", e18.rc.code, e18.why);
+    c204_dset_recycle(argv[1]);   // 描述符组按布局回收（#1096）：每个臂自己开 / 关会话
     if (!open_backend()) return 1;   // C201 同样自己一个会话
     c201_view_list();
     c201_fb_scan(0);

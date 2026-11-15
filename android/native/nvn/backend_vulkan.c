@@ -131,6 +131,8 @@ struct nvn_gpu_pipe_s {
     VkPipelineLayout layout;
     VkRenderPass pass;
     VkDescriptorSetLayout dsl[4];
+    struct dset_bin *dbin[4];   // 各组布局在回收登记表里的表项（#1096：第一次取组时登记、记在这里，之后取组直接用；NULL = 还没登记 / 上次登记失败）；dbin_gen 与 g_dset_gen 不同 = 表已随会话销毁，整体作废。只在持 g_dset_mu 时读写
+    uint32_t dbin_gen;
     uint32_t nset;
     nvn_gpu_layout_ent *stage_ents[6];
     VkFormat *stage_tfmt[6];
@@ -161,6 +163,8 @@ struct pass_rec { VkRenderPass rp; VkFramebuffer fb; };
 struct cmd_lay { struct nvn_gpu_tex_s *t; VkImageLayout cur; };
 enum { DESC_MEMO_N = 2048 };
 struct desc_memo { uint64_t h1, h2; VkDescriptorSetLayout dsl; VkDescriptorSet set; };
+struct dset_bin;
+struct dset_use { struct dset_bin *bin; VkDescriptorSet set; VkDescriptorPool pool; };   // 本段从按布局回收的表项里取的一组（见「描述符组按布局回收」）；bin = 取用时的表项，放回时直接放回它
 struct bc_temp { VkImage image; VkDeviceMemory memory; struct nvn_vk_bcdec_rec rec; struct bc_temp *next; };   // rec：缓冲 → BC 贴图录进段里的解码资源（#697）
 enum { TS_PASS_MAX = 250 };   // 调试读数：一段里逐个计时的通道数上限
 
@@ -186,6 +190,8 @@ struct nvn_gpu_cmd_s {
     VkDescriptorPool dpool;                  // 当前在分配的描述符池
     VkDescriptorPool *dpools_full;           // 已经分满的池：里面的组还被已录制的命令引用，段完成时一并销毁
     uint32_t ndpools_full, dpools_full_cap;
+    struct dset_use *dsu;                    // 本段从按布局回收表取过的描述符组：段完成时整批放回（放弃的段改为还给池）
+    uint32_t ndsu, dsu_cap, dsu_gen;         // dsu_gen：取第一组时的回收表代际（g_dset_gen）；放回时代际变了 = 表和池都已随会话销毁，不能再碰
     struct nvn_gpu_pipe_s *pipe;
     struct pass_rec *passes;
     struct desc_memo *memo;   // 这一段里写过的描述符组：内容 → 组（见 bind_descriptor_groups）；懒分配，随段释放
@@ -645,6 +651,247 @@ static void seg_drain(void) {
     pthread_mutex_unlock(&g_seg_mu);
 }
 
+// ---- 描述符组按布局回收（#1096）
+// 每笔绘制要的描述符组原先一组一次 vkAllocateDescriptorSets：真机世界场景每帧 2263 次、约 1.25 毫秒（驱动里每次还有一轮堆分配 / 释放），
+// 段做完整池交回回收表、取用时再 vkResetDescriptorPool。这里按布局（VkDescriptorSetLayout 句柄；每条管线各有自己的）留一串空闲的组：
+// alloc_sets 先取空闲的，取空了才向驱动要组：一个表项第一次要 1 组，之后每次要的翻倍（1、2、4、8），封顶 DSET_BATCH 组，多出的留在表里
+// （不一上来就分一批：世界场景里表项上万个、大多数只被用几次，每项预留 8 组会让表里躺着大量用不上的组，真机 300 秒末 :game 进程 TOTAL PSS 多占约 330 MB，见 #1096）；
+// 段完成（栅栏已发出：提交前整队清空过，记录必已做完）时
+// 把它取过的组整批放回；放弃的段（finish_cmd(c, 0)：两级回放开着时它的记录可能还在队列里）不放回，走 vkFreeDescriptorSets
+// （两级回放的包装里整队清空，录制线程不会还在读它）还给池。组从「增长池」分（带 FREE_DESCRIPTOR_SET 位，只增不重置；分满换新池），
+// 会话收尾整池销毁。建池失败 / 登记表项时内存不够 / 取用记录放不下 / 碰上完成线程正持锁，一律退回老路径（段自己的池），不拦任何操作。
+// 空闲串的上限：每个布局记「在途峰值」（取走还没放回的组数的最大值），每 DSET_WIN 个段完成滚一格（上一窗 / 本窗），
+// 空闲串超过「两倍峰值 + DSET_KEEP_MIN」的多出部分还给池（场景切换后旧管线的组不会一直占着）；稳态下空闲 ≈ 峰值，不会触发。
+// 连续 DSET_COLD_WIN 格窗口一次都没被取过、也没有在途的组的表项叫「冷」：空闲串整串还给池、数组一并收回、翻倍的批大小重新从 1 起。
+// （世界场景里建过上万条管线，每帧用到的只是其中几百条；其余的组躺在驱动里占内存、对帧时间没有任何用处。）
+// 回收的组里留着上一次写的描述符：本笔没写到的槽会一直指着上一段用过的视图 / 缓冲（老路径的新组里这些槽是未初始化的、不指向任何资源）。
+// 那些资源之后可能被销毁，而销毁可以发生在这一组已经绑进某一段、那一段还没做完的时候：validation 层把它当违规（VUID-vkDestroyBuffer-buffer-00922，
+// 或命令缓冲因「绑定的缓冲已销毁」失效），整套 vk 用例里 C204 臂 G 的旧写法（留着没重写的槽）偶发撞上过这两条。
+// 所以每一项记一个「写法」sig：这一笔给这一组写了哪几条描述符（每条的 binding 与数组项号各取散列、求和，与顺序无关）。第一次取到组时定下；
+// 之后写法不同的取用不从这一项取、走老路径（段自己的池，新组里没有残留）；写法相同的取用会把上一次写过的槽全部重写，不会留下旧描述符。
+// （一条管线的一组，写法由着色器声明的绑定决定、游戏必须全绑上，稳态下恒定；写法变了的只是回到回收前的做法，读数 dset_sigmiss 记次数。）
+// 布局只在会话收尾和建管线失败时销毁（前者在 nvn_gpu_close 里先于销毁管线收表，后者没人用过），所以表不用跟着布局摘表。
+// 调试开关 nvk_dset_rec（开会话时读一次，缺省 1；0 = 老路径，A/B 与负对照用）。
+// 表项（struct dset_bin）：每条管线的每一组布局一项。第一次取这一组时登记进 g_dset_bins（头插的单链表）、指针记在管线里（dbin），
+// 取用记录也带着它（dset_use.bin）：之后取组、放回都直接用这个指针，全程没有「按布局句柄查找」——每条管线有自己的布局，句柄不会被两条管线共用，
+// 查找只会落空。链表只在清扫 / 读数 / 收尾时遍历；表项数 = 本会话建过的（管线，组）数，随管线数一起涨，没有桶、没有上限，不会因为满了而退化。
+// （原先是按布局句柄散列的定长表：世界场景里 8192 项挤在 1024 个桶里，平均链长约 8，每次取 / 放沿链走、每一跳一次缓存未命中，
+// 真机取样（b19、直连）占回放线程 2.5%、全部取组路径 3.3%，见 #1096。）
+// 表项在一个会话内只增不减（只在 dset_close 里销毁），指针在会话内恒有效；代际 g_dset_gen（每次开会话 +1）挡住「表已销毁、管线里还留着旧指针」。
+enum { DSET_BATCH = 8, DSET_POOL_SETS = 1024, DSET_POOL_PER_TYPE = 4096, DSET_FREE_RUN = 256, DSET_WIN = 256, DSET_KEEP_MIN = 16, DSET_COLD_WIN = 2 };
+struct dset_ent { VkDescriptorSet set; VkDescriptorPool pool; };
+struct dset_bin {
+    struct dset_bin *next; VkDescriptorSetLayout dsl;   // next：登记表（g_dset_bins）里的下一项；dsl：这一项的布局（向驱动要组时用）
+    struct dset_ent *free; uint32_t nfree, cap;       // 空闲串（栈：后放回的先取）
+    uint32_t out, peak_cur, peak_prev;                // 在途组数 / 本窗在途峰值 / 上一窗在途峰值
+    uint8_t batch, cold;                              // batch：下一次向驱动要几组（0 当作 1，每次翻倍、封顶 DSET_BATCH）；cold：连续没被取过的窗口数（被取过就归 0）
+    uint8_t solo, dead;                               // solo：一批 DSET_BATCH 组放不进空池，改一组一组分；dead：一组也放不进空池，这个布局永远走老路径
+    uint8_t sig_set;                                  // sig 定下了吗（第一次取到组时定）
+    uint64_t sig;                                     // 这一项的组每次被写的「写法」：本笔写了哪几条描述符（binding + 数组项号，求和），见 dset_take
+};
+static pthread_mutex_t g_dset_mu = PTHREAD_MUTEX_INITIALIZER;   // 保护下面全部：回收表、增长池表、计数；对增长池的分配 / 释放也在它下面串行（Vulkan 要求池外部同步）
+static struct dset_bin *g_dset_bins;   // 登记表：本会话登记过的全部表项（头插的单链表）
+static uint32_t g_dset_nbins, g_dset_npools, g_dset_pools_cap;
+static VkDescriptorPool *g_dset_pools, g_dset_cur;
+static int g_dset_on, g_dset_closed = 1, g_dset_test_reject, g_dset_test_failreg;   // g_dset_test_failreg：用例注入，下 n 次登记表项当作内存不够（生产恒为 0，持 g_dset_mu 读写）
+static uint32_t g_dset_gen;   // 回收表代际：每次开会话 +1（持 g_dset_mu 改）
+static uint64_t g_dset_new, g_dset_reuse, g_dset_put, g_dset_freed, g_dset_trimmed, g_dset_taken, g_dset_done;   // 开会话起累计：向驱动新分的组 / 从表里复用的组 / 段完成放回的组 / 放弃的段还给池的组 / 超上限清扫还给池的组 / 交给 alloc_sets 的组（复用 + 新分的第一组）/ 有取用记录的段完成数
+static uint64_t g_dset_busy;   // 回放线程取组时碰上锁被持着、退回老路径的次数（原子累加，不在锁里）
+static uint64_t g_dset_sigmiss;   // 开会话起累计：这一笔的写法和表项里定下的不同、退回老路径的次数（持 g_dset_mu 改）
+static uint64_t g_dset_cold;      // 开会话起累计：表项变「冷」、整串收回的次数（每个表项每次变冷记一次，持 g_dset_mu 改）
+static uint32_t g_dset_active;    // 最近一次清扫时滚过的那一格窗口里被取过（或还有在途组）的表项数（持 g_dset_mu 改）
+// 恒等式（所有段都结束后、没有内存不足漏掉的组时）：taken == put + freed（交出去的组要么放回、要么还给池）；
+// new == idle + freed + trimmed（向驱动要来的每一组：在空闲串里 / 被放弃的段还给池 / 超上限清扫还给池，一组不多一组不少）。
+static struct dset_bin *dset_bin_new(VkDescriptorSetLayout l) {   // 持 g_dset_mu；登记一项，NULL = 内存不够
+    if (g_dset_test_failreg > 0) { g_dset_test_failreg--; return NULL; }
+    struct dset_bin *b = calloc(1, sizeof *b);
+    if (!b) return NULL;
+    b->dsl = l; b->next = g_dset_bins; g_dset_bins = b; g_dset_nbins++;
+    return b;
+}
+static int dset_bin_push(struct dset_bin *b, VkDescriptorSet set, VkDescriptorPool pool) {   // 持 g_dset_mu；0 = 内存不够
+    if (b->nfree == b->cap) {
+        uint32_t cap = b->cap ? b->cap * 2 : 16;
+        struct dset_ent *n = realloc(b->free, cap * sizeof *n);
+        if (!n) return 0;
+        b->free = n; b->cap = cap;
+    }
+    b->free[b->nfree].set = set; b->free[b->nfree].pool = pool; b->nfree++;
+    return 1;
+}
+// 把同一个池的一串组还给池（持 g_dset_mu：对同一个池的分配 / 释放不能并发）
+static void dset_free_run(VkDescriptorPool pool, const VkDescriptorSet *sets, uint32_t n) {
+    if (n) (void)vkFreeDescriptorSets(g.d, pool, n, sets);
+}
+static int dset_new_pool(void) {   // 持 g_dset_mu
+    VkDescriptorPoolSize ps[8] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DSET_POOL_PER_TYPE}, {VK_DESCRIPTOR_TYPE_SAMPLER, DSET_POOL_PER_TYPE},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DSET_POOL_PER_TYPE}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, DSET_POOL_PER_TYPE},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DSET_POOL_PER_TYPE}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, DSET_POOL_PER_TYPE},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, DSET_POOL_PER_TYPE}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, DSET_POOL_PER_TYPE}};
+    if (g_dset_npools == g_dset_pools_cap) {
+        uint32_t cap = g_dset_pools_cap ? g_dset_pools_cap * 2 : 8;
+        VkDescriptorPool *np = realloc(g_dset_pools, cap * sizeof *np);
+        if (!np) return 0;
+        g_dset_pools = np; g_dset_pools_cap = cap;
+    }
+    VkDescriptorPoolCreateInfo dpi;
+    memset(&dpi, 0, sizeof dpi);
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpi.maxSets = DSET_POOL_SETS;
+    dpi.poolSizeCount = 8;
+    dpi.pPoolSizes = ps;
+    VkDescriptorPool p = VK_NULL_HANDLE;
+    OC(OC_DPOOL);
+    if (vkCreateDescriptorPool(g.d, &dpi, NULL, &p) != VK_SUCCESS) return 0;
+    g_dset_pools[g_dset_npools++] = p;
+    g_dset_cur = p;
+    return 1;
+}
+// 向驱动要一批组：第一个给调用方，其余留在该布局的空闲串里。要几组看表项的 batch：第一次 1 组，之后每次翻倍（1、2、4、8），封顶 DSET_BATCH，
+// 所以只被用过几次的表项手里不会攥着一批用不上的组，常用的表项几次翻倍后就和一次要 8 组一样。
+// 0 = 驱动不给（调用方退回老路径）。持 g_dset_mu
+// 当前池分满（池耗尽 / 碎片）就换新池重分；新池（空池）也放不下一批，说明这个布局的组太大：改成一组一组分，一组也放不下就把这个布局标成 dead（永远走老路径，
+// 不再每次都建一个新池）。
+static int dset_refill(struct dset_bin *b, VkDescriptorSet *first, VkDescriptorPool *from) {
+    if (b->dead) return 0;
+    VkDescriptorSetLayout lay[DSET_BATCH]; VkDescriptorSet sets[DSET_BATCH];
+    for (int i = 0; i < DSET_BATCH; i++) lay[i] = b->dsl;
+    uint32_t want = b->solo ? 1 : b->batch ? b->batch : 1;
+    int fresh = 0;   // 本次调用里用的是新建的池：分不出来就说明这一批（一组）本身超过了空池的容量
+    for (int tries = 0; tries < 4; tries++) {
+        if (!g_dset_cur) { if (!dset_new_pool()) return 0; fresh = 1; }
+        VkDescriptorSetAllocateInfo ai;
+        memset(&ai, 0, sizeof ai);
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = g_dset_cur;
+        ai.descriptorSetCount = want;
+        ai.pSetLayouts = lay;
+        OC(OC_DALLOC);
+        const int inj = __atomic_load_n(&g_dset_test_reject, __ATOMIC_RELAXED);   // 用例注入（见 nvn_vk_dbg_dset_inject），生产恒为 0
+        VkResult r = (inj == 2 || (inj == 1 && want > 1)) ? VK_ERROR_OUT_OF_POOL_MEMORY : vkAllocateDescriptorSets(g.d, &ai, sets);
+        if (r == VK_SUCCESS) {
+            *first = sets[0]; *from = g_dset_cur;
+            for (uint32_t i = 1; i < want; i++) if (!dset_bin_push(b, sets[i], g_dset_cur)) break;   // 内存不够只会少留几组：留不下的随池一起销毁
+            g_dset_new += want;
+            if (!b->solo && want < DSET_BATCH) b->batch = (uint8_t)(2 * want);   // 下一次要的翻倍
+            return 1;
+        }
+        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) return 0;
+        if (fresh) {
+            if (want > 1) { want = 1; b->solo = 1; continue; }   // 同一个空池，改一组一组分再试
+            b->dead = 1;
+            return 0;
+        }
+        g_dset_cur = VK_NULL_HANDLE;   // 当前池分满：它留在 g_dset_pools 里（组还有在用的），下一轮换新池
+    }
+    return 0;
+}
+// alloc_sets 的快路：1 = 取到了（已记进本段的取用记录），0 = 退回老路径。
+// 用 trylock：完成线程在放回 / 清扫 / 还池时会持锁，回放线程是关键路径，碰上就直接走老路径（多一次驱动分配），不等锁。
+// sig：这一笔给这一组写的「写法」（write_binds 求出，见上面的说明）。表项里还没定写法就用这一笔的；已经定了而这一笔不同，就不从这一项取：
+// 表项里的组都只被这一种写法写过，换一种写法去写，没被重写的槽会留着上一次的描述符。
+static int dset_take(struct nvn_gpu_cmd_s *c, struct nvn_gpu_pipe_s *p, uint32_t set, uint64_t sig, VkDescriptorSet *out) {
+    int ok = 0;
+    if (pthread_mutex_trylock(&g_dset_mu) != 0) { __atomic_fetch_add(&g_dset_busy, 1, __ATOMIC_RELAXED); return 0; }
+    struct dset_bin *b = NULL;
+    if (!g_dset_closed) {
+        if (p->dbin_gen != g_dset_gen) { memset(p->dbin, 0, sizeof p->dbin); p->dbin_gen = g_dset_gen; }   // 表是上个会话的：这条管线记的指针全部作废
+        b = p->dbin[set];
+        if (!b) b = p->dbin[set] = dset_bin_new(p->dsl[set]);   // 第一次取这一组：登记。内存不够（NULL）不记，这次退回老路径，下次再试
+    }
+    if (b && b->sig_set && b->sig != sig) { g_dset_sigmiss++; b = NULL; }   // 写法不同：不从这一项取（老路径）
+    if (b && c->ndsu == c->dsu_cap) {   // 先给本段的取用记录留好位置，之后取到的组一定记得下来
+        uint32_t cap = c->dsu_cap ? c->dsu_cap * 2 : 256;
+        struct dset_use *n = realloc(c->dsu, cap * sizeof *n);
+        if (n) { c->dsu = n; c->dsu_cap = cap; } else b = NULL;
+    }
+    if (b) {
+        VkDescriptorSet s = VK_NULL_HANDLE; VkDescriptorPool from = VK_NULL_HANDLE;
+        if (b->nfree) { s = b->free[--b->nfree].set; from = b->free[b->nfree].pool; g_dset_reuse++; ok = 1; }
+        else ok = dset_refill(b, &s, &from);
+        if (ok) {
+            if (!b->sig_set) { b->sig = sig; b->sig_set = 1; }   // 第一次取到组：这一项的写法定为这一笔的
+            if (!c->ndsu) c->dsu_gen = g_dset_gen;
+            c->dsu[c->ndsu].bin = b; c->dsu[c->ndsu].set = s; c->dsu[c->ndsu].pool = from; c->ndsu++; *out = s; g_dset_taken++;
+            if (++b->out > b->peak_cur) b->peak_cur = b->out;
+        }
+    }
+    pthread_mutex_unlock(&g_dset_mu);
+    return ok;
+}
+// 清扫（持 g_dset_mu）：各布局的在途峰值窗口滚一格；空闲串超过「两倍峰值 + DSET_KEEP_MIN」的多出部分还给池；
+// 连续 DSET_COLD_WIN 格窗口没被取过的「冷」表项整串还给池（并把数组收回、批大小归零）。
+// 滚完之后 peak_prev 是刚结束那一格里的在途峰值：> 0 就是这一格里被取过、或还有取走没放回的组（peak_cur 滚进窗口时以当时的在途数起头，所以在途的组一定算在内）；
+// 为 0 说明这一格里这个表项一次都没被碰过，此时它的在途数必为 0，空闲串里的组都是已经放回的、没有哪一段还在引用。
+static void dset_sweep(void) {
+    VkDescriptorSet run[DSET_FREE_RUN]; uint32_t nrun = 0; VkDescriptorPool run_pool = VK_NULL_HANDLE;
+    uint32_t active = 0;
+    for (struct dset_bin *b = g_dset_bins; b; b = b->next) {
+        b->peak_prev = b->peak_cur; b->peak_cur = b->out;
+        if (b->peak_prev) { b->cold = 0; active++; } else if (b->cold < 255) { if (++b->cold == DSET_COLD_WIN) g_dset_cold++; }
+        const int cold = b->cold >= DSET_COLD_WIN;
+        const uint32_t pk = b->peak_prev > b->peak_cur ? b->peak_prev : b->peak_cur, keep = cold ? 0 : 2 * pk + DSET_KEEP_MIN;
+        while (b->nfree > keep) {
+            const struct dset_ent *e = &b->free[--b->nfree];
+            if (nrun && (e->pool != run_pool || nrun == DSET_FREE_RUN)) { dset_free_run(run_pool, run, nrun); g_dset_trimmed += nrun; nrun = 0; }
+            run_pool = e->pool; run[nrun++] = e->set;
+        }
+        if (cold) {   // 空闲串已被上面的循环取空（句柄都抄进了 run，随后还给池）：数组留着也是白占，收回；批大小归零，再被用到时从 1 组起翻倍
+            free(b->free); b->free = NULL; b->cap = 0; b->batch = 0;
+        }
+    }
+    if (nrun) { dset_free_run(run_pool, run, nrun); g_dset_trimmed += nrun; }
+    g_dset_active = active;
+}
+// 段结束（finish_cmd）：执行过的段把取过的组整批放回各自表项的空闲串；放弃的段 / 空闲串放不下（内存不够）的，还给池
+static void dset_release(struct nvn_gpu_cmd_s *c, int executed) {
+    if (c->ndsu) {
+        VkDescriptorSet run[DSET_FREE_RUN]; uint32_t nrun = 0; VkDescriptorPool run_pool = VK_NULL_HANDLE;
+        pthread_mutex_lock(&g_dset_mu);
+        const int live = !g_dset_closed && c->dsu_gen == g_dset_gen;   // 池已随会话销毁（或已换了新会话）：组跟着没了，不能再碰；锁里这个结论不会变
+        for (uint32_t i = 0; i < c->ndsu; i++) {
+            const struct dset_use *u = &c->dsu[i];
+            if (!live) break;
+            struct dset_bin *b = u->bin;
+            if (b->out) b->out--;
+            if (executed && dset_bin_push(b, u->set, u->pool)) { g_dset_put++; continue; }
+            if (nrun && (u->pool != run_pool || nrun == DSET_FREE_RUN)) { dset_free_run(run_pool, run, nrun); g_dset_freed += nrun; nrun = 0; }
+            run_pool = u->pool; run[nrun++] = u->set;
+        }
+        if (nrun && live) { dset_free_run(run_pool, run, nrun); g_dset_freed += nrun; }
+        if (live && ++g_dset_done % DSET_WIN == 0) dset_sweep();
+        pthread_mutex_unlock(&g_dset_mu);
+    }
+    free(c->dsu); c->dsu = NULL; c->ndsu = c->dsu_cap = 0;
+}
+static uint64_t dset_idle_total(void) {   // 空闲串里现有的组
+    uint64_t n = 0;
+    pthread_mutex_lock(&g_dset_mu);
+    for (const struct dset_bin *b = g_dset_bins; b; b = b->next) n += b->nfree;
+    pthread_mutex_unlock(&g_dset_mu);
+    return n;
+}
+static void dset_open(void) {
+    const int on = nvn_plat_flag("nvk_dset_rec", 1) != 0;
+    pthread_mutex_lock(&g_dset_mu);
+    __atomic_store_n(&g_dset_on, on, __ATOMIC_RELAXED); g_dset_closed = 0;
+    g_dset_gen++;   // 新会话的表是空的：上个会话里管线记的表项指针全部作废
+    g_dset_new = g_dset_reuse = g_dset_put = g_dset_freed = g_dset_trimmed = g_dset_taken = g_dset_done = g_dset_sigmiss = g_dset_cold = 0; g_dset_active = 0;
+    __atomic_store_n(&g_dset_busy, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_dset_mu);
+}
+static void dset_close(void) {   // 会话收尾：所有段都完成了、设备空闲；整池销毁（组随池一起没了）
+    pthread_mutex_lock(&g_dset_mu);
+    g_dset_closed = 1;
+    for (struct dset_bin *b = g_dset_bins, *nx; b; b = nx) { nx = b->next; free(b->free); free(b); }
+    g_dset_bins = NULL; g_dset_nbins = 0;
+    for (uint32_t i = 0; i < g_dset_npools; i++) vkDestroyDescriptorPool(g.d, g_dset_pools[i], NULL);
+    free(g_dset_pools); g_dset_pools = NULL; g_dset_npools = g_dset_pools_cap = 0; g_dset_cur = VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_dset_mu);
+}
+
 // 贴图显存块的小池。动态分辨率的游戏每帧换渲染目标的宽高，每张新图都向驱动要一块显存、旧图拆的时候还回去：
 // 一款 3D 游戏每帧 10 张时「要显存并绑定」1.24 毫秒 + 拆 0.41 毫秒（直接计时）。拆贴图时把显存块留在池里，
 // 新图要的大小落在某块的 [块的 4/5, 块] 之间、内存类型相同就直接绑它（图已经拆了的显存块可以再绑给别的图）。
@@ -1064,6 +1311,7 @@ static void finish_cmd(struct nvn_gpu_cmd_s *c, int executed) {
     seg_give_desc(c->dpool);
     for (uint32_t i = 0; i < c->ndpools_full; i++) seg_give_desc(c->dpools_full[i]);
     free(c->dpools_full);
+    dset_release(c, executed);   // 按布局回收的描述符组：执行过的段放回空闲串，放弃的段还给池（#1096）
     if (c->tsq) vkDestroyQueryPool(g.d, c->tsq, NULL);
         seg_give_q(c->qpool, c->qcount);
     free(c->q_used);
@@ -1558,6 +1806,7 @@ nvn_gpu_rc nvn_gpu_open(const nvn_gpu_open_desc *d, nvn_gpu_err *err) {
         pthread_condattr_destroy(&ca);
         g_cv_ready = 1;
     }
+    dset_open();   // 按布局回收的描述符组（#1096）：开关在开会话时读一次
     fill_caps(&g, d);
     if (pthread_create(&g.worker, NULL, worker_main, &g) != 0)
         return fail(err, NVN_GPU_E_DEVICE, "worker 线程创建失败");
@@ -1712,6 +1961,7 @@ nvn_gpu_rc nvn_gpu_close(uint64_t timeout_ns, nvn_gpu_err *err) {
     }
     clr_close();
     depth_blit_close();
+    dset_close();   // 在途段都完成了：增长池整池销毁（组随池一起没了；布局只在收尾和建管线失败时销毁，前者这里已先收表，后者没人用过，所以回收表不用跟着布局摘表）
     struct nvn_gpu_pipe_s *p = g.pipes;
     g.pipes = NULL;
     free(g_pipe_ht); g_pipe_ht = NULL; g_pipe_ht_n = 0; g_pipe_cnt = 0;
@@ -3913,7 +4163,10 @@ static int new_dpool(struct nvn_gpu_cmd_s *c) {
     return 1;
 }
 // 给一笔绘制 / 派发分配它的 n 组描述符。0 = 失败（已记粘滞错误）
-static int alloc_sets(struct nvn_gpu_cmd_s *c, const VkDescriptorSetLayout *dsl, uint32_t n, VkDescriptorSet *sets) {
+// p / set：这一组属于哪条管线的第几组（dsl 就是 p->dsl + set；回收表的表项指针记在管线里，见 dset_take）；
+// p 为 NULL = 这一组不属于任何管线（深度模板缩放自己的布局），不进回收，直接走下面老路径；sig：这一笔给这一组写的写法（p 为 NULL 时不看）
+static int alloc_sets(struct nvn_gpu_cmd_s *c, const VkDescriptorSetLayout *dsl, uint32_t n, VkDescriptorSet *sets, struct nvn_gpu_pipe_s *p, uint32_t set, uint64_t sig) {
+    if (n == 1 && p && __atomic_load_n(&g_dset_on, __ATOMIC_RELAXED) && dset_take(c, p, set, sig, sets)) return 1;   // 按布局回收（#1096）；取不到才走下面老路径
     for (int fresh = 0; fresh < 2; fresh++) {
         if (!c->dpool && !new_dpool(c)) return 0;
         VkDescriptorSetAllocateInfo ai;
@@ -3951,9 +4204,16 @@ static VkImageLayout bind_image_layout(struct nvn_gpu_cmd_s *c, struct nvn_gpu_v
 // 缺成员的新类别（IMAGE / TBUF / IMAGE_TBUF）报 E_LAYOUT；老类别保持 NULL 句柄空资源写法不变。
 // 只写 dirty 里的组（没变的组沿用上一笔的描述符集对象，不重写）。纹素缓冲的格式核对取决于管线，
 // 组没变、管线换了也要核，所以这两类不在脏组里也走一遍核对，只是不写。
+// sig[组]：把这一笔写进该组的每一条（binding 与数组项号）的散列加进去，求和与顺序无关；取组时按它挑回收表的表项（见 dset_take）。
+static inline uint64_t dset_sig_mix(uint32_t binding, uint32_t elem) {
+    uint64_t x = ((uint64_t)binding << 32 | elem) + 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
 static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, int st, uint32_t dirty,
                        const VkDescriptorSet *sets, VkWriteDescriptorSet *wr,
-                       VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi) {
+                       VkDescriptorImageInfo *ii, VkDescriptorBufferInfo *bi, uint64_t *sig) {
     int nw = 0;
     for (uint32_t i = 0; i < c->nbinds[st]; i++) {
         const nvn_gpu_binding *b = &c->binds[st][i].b;
@@ -3969,6 +4229,7 @@ static int write_binds(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_pipe_s *p, 
         w->dstArrayElement = b->elem;
         w->descriptorCount = 1;
         w->descriptorType = vk_desc_type(e->cls);
+        if (live) sig[e->set] += dset_sig_mix(e->binding, b->elem);
         VkDescriptorImageInfo *im = &ii[nw];
         VkDescriptorBufferInfo *bf = &bi[nw];
         switch (e->cls) {
@@ -4072,17 +4333,29 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     static int memo_cur = -1; static uint32_t memo_k;
     if (memo_cur < 0 || !(++memo_k & 255)) memo_cur = nvn_plat_flag("nvk_desc_memo", 0) != 0;
     const int memo = memo_cur && dirty;
-    VkDescriptorSet mark[4];   // 备忘开着时先不分配：写入项里先放记号，认出每条属于哪一组
-    if (memo) { for (uint32_t set = 0; set < 4; set++) mark[set] = (VkDescriptorSet)(uintptr_t)(0x5a0 + set); }
-    else for (uint32_t set = 0; set < p->nset; set++)
-        if (dirty & (1u << set)) if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set)) return 0;
+    // 先不分配：写入项里先放记号（认出每条属于哪一组），写完才知道每一组这一笔的「写法」（write_binds 的 sig），再按写法去回收表取组（见 dset_take）。
+    // 备忘开着时命中的组连取都省了；备忘关着时取完组把记号换成真的组。
+    VkDescriptorSet mark[4];
+    for (uint32_t set = 0; set < 4; set++) mark[set] = (VkDescriptorSet)(uintptr_t)(0x5a0 + set);
+    uint64_t sig[4] = {0, 0, 0, 0};
     const uint64_t t1 = tm ? now_ns() : 0;
     VkWriteDescriptorSet wr[6 * 64]; VkDescriptorImageInfo ii[6 * 64]; VkDescriptorBufferInfo bi[6 * 64];
     uint32_t nw = 0;
     for (int st = compute ? NVN_GPU_SH_CS : 0; st < (compute ? NVN_GPU_SH_CS + 1 : 5); st++) {
-        int n = write_binds(c, p, st, dirty, memo ? mark : c->desc_sets, wr + nw, ii + nw, bi + nw);
+        int n = write_binds(c, p, st, dirty, mark, wr + nw, ii + nw, bi + nw, sig);
         if (n < 0) return 0;
         nw += (uint32_t)n;
+    }
+    uint64_t ta = 0;   // 诊断：取组用时（备忘开着时取组在下面的备忘块里，不单独计）
+    if (!memo) {
+        const uint64_t ta0 = tm ? now_ns() : 0;
+        for (uint32_t set = 0; set < p->nset; set++)
+            if (dirty & (1u << set)) if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set, pm, set, sig[set])) return 0;
+        for (uint32_t i = 0; i < nw; i++) {   // 记号换成真的组（write_binds 只写脏组，记号一定落在 0..3）
+            const uint32_t set = (uint32_t)((uintptr_t)wr[i].dstSet - 0x5a0);
+            if (set < 4) wr[i].dstSet = c->desc_sets[set];
+        }
+        if (tm) ta = now_ns() - ta0;
     }
     if (memo) {
         uint64_t h1[4], h2[4]; uint32_t hit = 0;
@@ -4105,7 +4378,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
                 if (m->h1 == h1[set] && m->h2 == h2[set] && m->dsl == p->dsl[set]) { c->desc_sets[set] = m->set; found = 1; break; }
             }
             if (found) { hit |= 1u << set; continue; }
-            if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set)) return 0;
+            if (!alloc_sets(c, p->dsl + set, 1, c->desc_sets + set, pm, set, sig[set])) return 0;
             if (slot && c->memo_n < DESC_MEMO_N * 3 / 4) { slot->h1 = h1[set]; slot->h2 = h2[set]; slot->dsl = p->dsl[set]; slot->set = c->desc_sets[set]; c->memo_n++; }
         }
         uint32_t keep = 0;   // 命中的组不用写：把它们的写入项去掉，其余的换上真的组
@@ -4150,7 +4423,7 @@ static int bind_descriptor_groups(struct nvn_gpu_cmd_s *c, const struct nvn_gpu_
     if (dirty && p->nset) vkCmdBindDescriptorSets(c->cb, compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                   p->layout, 0, p->nset, c->desc_sets, 0, NULL);
     if (tm) { const uint64_t t4 = now_ns();
-        __atomic_fetch_add(&g_desc_ns[0], t1 - t0, __ATOMIC_RELAXED); __atomic_fetch_add(&g_desc_ns[1], t2 - t1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_desc_ns[0], (t1 - t0) + ta, __ATOMIC_RELAXED); __atomic_fetch_add(&g_desc_ns[1], (t2 - t1) - ta, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_desc_ns[2], t3 - t2, __ATOMIC_RELAXED); __atomic_fetch_add(&g_desc_ns[3], t4 - t3, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_desc_nw, nw, __ATOMIC_RELAXED); __atomic_fetch_add(&g_desc_sets, (uint64_t)__builtin_popcount(dirty), __ATOMIC_RELAXED); }
     return 1;
@@ -6342,6 +6615,26 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
     if (take) memset(g.stats, 0, sizeof g.stats);
     pthread_mutex_unlock(&g_mu);
     for (int i = 0; i < STAT_N; i++) fn(user, stat_names[i], v[i]);
+    // 描述符组按布局回收（#1096）：开会话起累计，不随 take 清零
+    pthread_mutex_lock(&g_dset_mu);
+    const uint64_t ds_new = g_dset_new, ds_reuse = g_dset_reuse, ds_put = g_dset_put, ds_freed = g_dset_freed, ds_trimmed = g_dset_trimmed, ds_taken = g_dset_taken, ds_pools = g_dset_npools, ds_bins = g_dset_nbins, ds_sigmiss = g_dset_sigmiss;
+    const uint64_t ds_cold = g_dset_cold, ds_active = g_dset_active;
+    uint64_t ds_idle = 0;
+    for (const struct dset_bin *b = g_dset_bins; b; b = b->next) ds_idle += b->nfree;
+    pthread_mutex_unlock(&g_dset_mu);
+    fn(user, "dset_taken", ds_taken);   // 交给 alloc_sets 的组（复用 + 新分的第一组）
+    fn(user, "dset_new", ds_new);       // 向驱动新分的组（每个表项第一次 1 组、之后翻倍，封顶 DSET_BATCH 组）
+    fn(user, "dset_reuse", ds_reuse);   // 从空闲串复用的组
+    fn(user, "dset_put", ds_put);       // 段完成放回空闲串的组
+    fn(user, "dset_freed", ds_freed);   // 放弃的段还给池的组
+    fn(user, "dset_trimmed", ds_trimmed);   // 空闲串超上限、清扫时还给池的组
+    fn(user, "dset_busy", __atomic_load_n(&g_dset_busy, __ATOMIC_RELAXED));   // 回放线程取组碰上锁被持着、退回老路径的次数
+    fn(user, "dset_pools", ds_pools);   // 增长池个数
+    fn(user, "dset_bins", ds_bins);     // 表项数（本会话登记过的（管线，组）数）
+    fn(user, "dset_idle", ds_idle);     // 空闲串里现有的组
+    fn(user, "dset_sigmiss", ds_sigmiss);   // 这一笔的写法和表项里定下的不同、退回老路径的次数（稳态应为 0 或很少）
+    fn(user, "dset_active", ds_active);     // 最近一次清扫滚过的那格窗口里被取过的表项数（对照 dset_bins：其余的表项这一格里没人用）
+    fn(user, "dset_cold", ds_cold);         // 表项连续 DSET_COLD_WIN 格窗口没被取过、整串收回的累计次数
     // 会话级读数（开会话起累计，不随 take 清零）：驱动管线缓存（#822）
     fn(user, "pipe_cache_loaded_bytes", g_plc_loaded);                              // 开会话时读到并交给驱动的字节数（0 = 没读到）
     fn(user, "pipe_cache_rejected", g_plc_rejected);                                // 旧文件读不出 / 驱动不收、被丢掉的次数
@@ -6366,6 +6659,50 @@ void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) {
 // 2 帧缓冲缓存里现存的项数；3 自检档（nvk_fbdrop=2）扫到的残留数（缺省档恒为 0）；
 // 4 视图链的结构违例数（每个节点：前驱指针指回自己、后继的反向指针指回本节点的 all_next，应恒为 0）；
 // 5 让 nvk_ulist / nvk_fbdrop 两个开关的缓存作废（用例改了开关值后立刻生效，返回 0）；6 帧缓冲缓存全表扫的累计次数。
+// 描述符组按布局回收的用例读数钩子（只给宿主单测）：0 新分（向驱动）/ 1 复用 / 2 放回 / 3 放弃的段还给池 / 4 交给 alloc_sets 的总数 /
+// 5 空闲串里现有的组（沿登记表遍历数出来的）/ 6 表项数（登记的计数）/ 7 增长池个数 / 8 dead 的表项数（一组也放不进空池的布局）/ 9 回收开着吗（开会话时读的开关）/
+// 10 超上限清扫还给池的组 / 11 取组碰锁退回老路径的次数（不要锁）/ 12 清扫已滚过的格数（有取用记录的段完成数 / DSET_WIN）/
+// 13 沿登记表遍历数出来的表项数（应恒等于 6：对不上就是链表丢了项）/ 14 写法不同退回老路径的次数 / 15 回收表代际（每次开会话 +1）/
+// 16 最近一次清扫滚过的窗口里被取过的表项数 / 17 变冷整串收回的累计次数 / 18 沿登记表数出来的、手里攥着空闲串数组的表项数（冷表项收回后应为 0）。
+uint64_t nvn_vk_dbg_dset_stat(int which);
+uint64_t nvn_vk_dbg_dset_stat(int which) {
+    uint64_t r = 0;
+    if (which == 9) return (uint64_t)__atomic_load_n(&g_dset_on, __ATOMIC_RELAXED);
+    if (which == 11) return __atomic_load_n(&g_dset_busy, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_dset_mu);
+    switch (which) {
+    case 0: r = g_dset_new; break;
+    case 1: r = g_dset_reuse; break;
+    case 2: r = g_dset_put; break;
+    case 3: r = g_dset_freed; break;
+    case 4: r = g_dset_taken; break;
+    case 5: for (const struct dset_bin *b = g_dset_bins; b; b = b->next) r += b->nfree; break;
+    case 6: r = g_dset_nbins; break;
+    case 7: r = g_dset_npools; break;
+    case 8: for (const struct dset_bin *b = g_dset_bins; b; b = b->next) r += b->dead; break;
+    case 10: r = g_dset_trimmed; break;
+    case 12: r = g_dset_done / DSET_WIN; break;
+    case 13: for (const struct dset_bin *b = g_dset_bins; b; b = b->next) r++; break;
+    case 14: r = g_dset_sigmiss; break;
+    case 15: r = g_dset_gen; break;
+    case 16: r = g_dset_active; break;
+    case 17: r = g_dset_cold; break;
+    case 18: for (const struct dset_bin *b = g_dset_bins; b; b = b->next) r += b->free != NULL; break;
+    default: break;
+    }
+    pthread_mutex_unlock(&g_dset_mu);
+    return r;
+}
+// 用例注入（只给宿主单测）：0 不注入；1 一批（> 1 组）向驱动要组时回「池耗尽」，模拟一批放不进空池；2 任何一次向增长池要组都回「池耗尽」，模拟一组也放不进空池。
+void nvn_vk_dbg_dset_inject(int mode);
+void nvn_vk_dbg_dset_inject(int mode) { __atomic_store_n(&g_dset_test_reject, mode, __ATOMIC_RELAXED); }
+// 用例注入（只给宿主单测）：接下来 n 次登记表项当作内存不够（0 = 取消）。被注入的那几次取组退回老路径、不记结果，下一次取组再登记。
+void nvn_vk_dbg_dset_failreg(int n);
+void nvn_vk_dbg_dset_failreg(int n) { pthread_mutex_lock(&g_dset_mu); g_dset_test_failreg = n > 0 ? n : 0; pthread_mutex_unlock(&g_dset_mu); }
+// 用例（只给宿主单测）：1 = 调用线程持着回收表的锁，回放 / 录制线程取组时 trylock 碰锁、退回老路径；0 = 放开。持着期间不能调用要这把锁的读数（nvn_vk_dbg_dset_stat 的 9 / 11 不要锁）。
+void nvn_vk_dbg_dset_hold(int on);
+void nvn_vk_dbg_dset_hold(int on) { if (on) pthread_mutex_lock(&g_dset_mu); else pthread_mutex_unlock(&g_dset_mu); }
+
 uint64_t nvn_vk_dbg_view_stat(int which) {
     uint64_t r = 0;
     switch (which) {
