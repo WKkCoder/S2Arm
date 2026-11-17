@@ -28,6 +28,7 @@ static uint64_t g_fake_hits = 12345;
 int nvn_plat_flag(const char *name, int dflt) {
     if (!strcmp(name, "nvk_warm_max")) { const char *e = getenv("S2A_PW_MAX"); return e && *e ? atoi(e) : dflt; }
     if (!strcmp(name, "nvk_pw_diag")) { const char *e = getenv("S2A_PW_DIAG"); return e && *e ? atoi(e) : dflt; }   // #1372：诊断开关，缺省 0
+    if (!strcmp(name, "nvk_pw_heap")) { const char *e = getenv("S2A_PW_HEAP"); return e && *e ? atoi(e) : dflt; }   // 淘汰堆开关，缺省 1
     return dflt;
 }
 // 日志替身：把诊断行（pipe 类、带「预热清单诊断」）存下来给用例看，其余丢弃。
@@ -891,6 +892,92 @@ static int mode_tag_twin(void) {
     return g_fail;
 }
 
+// ---- 模式：淘汰堆与整表线性扫出同一份清单 ----
+// 满表之后每新记一条都要挑牺牲者（uses 最小、同 uses 最久没用）。缺省走淘汰堆（O(层数)），S2A_PW_HEAP=0 走原来的整表线性扫（O(容量)）。
+// 同一串 note（6 个热配方 / 30 个中等 / 共 64 种，上限 24 / 5 / 200：前两档槽不断被淘汰重用，第三档不淘汰），分三个阶段、各在自己的进程里跑：
+//   阶段 1：空目录起跑，note 4000 步，落盘；阶段 2：新进程先载入阶段 1 的清单（淘汰堆整体重建），再 note 4000 步（另一个种子），落盘；
+//   阶段 3：uses 回绕（见 mode_victim_wrap）。
+// 父进程把「缺省」与「S2A_PW_HEAP=0」各跑一遍，逐字节比三个阶段的清单文件（条数、各条 uses、顺序都在文件里）。
+// 每一步之后都核对堆性质，以及堆选出的牺牲者与整表线性扫选出的是同一个槽（nvk_pipe_warm_test_victim_check）；
+// 并核对这一臂走的确实是它该走的路径（缺省臂必须是堆：把缺省值写反的实现不会靠「两臂都走线性扫」蒙混过去）。
+enum { VIC_STEPS = 4000, VIC_NREC = 64 };
+static int mode_victim_run(int phase, int cap) {
+    char cs[16];
+    snprintf(cs, sizeof cs, "%d", cap);
+    setenv("S2A_PW_MAX", cs, 1);
+    const char *hv = getenv("S2A_PW_HEAP");
+    const int want_heap = hv && *hv ? atoi(hv) != 0 : 1;   // 开关没设 = 缺省 = 堆
+    if (phase == 2) {
+        const int n = nvk_pipe_warm_load();
+        CHECK(n > 0 && n <= cap, "victim: phase 2 must load the phase 1 list (<= cap %d), got %d", cap, n);
+        CHECK(nvk_pipe_warm_test_victim_check() == 0, "victim: right after load the heap check must hold, item %d", nvk_pipe_warm_test_victim_check());
+        CHECK(nvk_pipe_warm_test_heap_stale() == (want_heap ? 0 : -1), "victim: right after load every stored key must equal the real key (heap arm 0, scan arm -1), got %d", nvk_pipe_warm_test_heap_stale());
+    }
+    uint32_t x = phase == 1 ? 90210u : 31337u;
+    for (int step = 0; step < VIC_STEPS && !g_fail; step++) {
+        x = x * 1103515245u + 12345u;
+        const uint32_t k = (x >> 16) & 0xffu;
+        const int r = k < 128 ? (int)(k % 6u) : k < 200 ? (int)(6u + k % 30u) : (int)(k % (uint32_t)VIC_NREC);
+        tag_note((int)((x >> 25) & 1u), r);                  // 一半走完整路径、一半走标签快路径：两条都会 uses++ / 刷新最近序号
+        const int vc = nvk_pipe_warm_test_victim_check();
+        CHECK(vc == 0, "victim: phase %d cap %d step %d: the heap check failed (item %d)", phase, cap, step, vc);
+    }
+    CHECK(nvk_pipe_warm_test_vmode() == (want_heap ? 1 : 0), "victim: this arm must use the %s path, vmode=%d", want_heap ? "heap" : "scan", nvk_pipe_warm_test_vmode());
+    struct nvk_pipe_warm_stats st;
+    nvk_pipe_warm_stats(&st);
+    if (cap < VIC_NREC) CHECK(st.rejected > 100, "victim: cap %d against %d recipes must evict a lot, evictions=%llu", cap, VIC_NREC, (unsigned long long)st.rejected);
+    else CHECK(st.rejected == 0, "victim: cap %d holds all %d recipes, nothing may be evicted, evictions=%llu", cap, VIC_NREC, (unsigned long long)st.rejected);
+    nvk_pipe_warm_save();
+    return g_fail;
+}
+
+// 阶段 3：uses 回绕。清单里的 uses 是 u32，4294967295 + 1 回绕成 0：一条最热的配方瞬间变成最冷，键变小，在堆里要上浮（只下沉的实现会留下堆序错误）。
+// 父进程已把阶段 2 清单第 0 条（uses 最大）的 uses 改成 4294967295 并按盘上格式重算了整份校验和。这里载入它、再记它一次（回绕成 0），
+// 再记 40 份新配方把表挤满、挤出：每一步都核对堆性质，以及堆选出的牺牲者与整表线性扫选出的相同（回绕之后线性扫选的是 uses 0 的这一条）；
+// 落盘清单由父进程逐字节比两条路径。
+static int mode_victim_wrap(int cap) {
+    char cs[16];
+    snprintf(cs, sizeof cs, "%d", cap);
+    setenv("S2A_PW_MAX", cs, 1);
+    const char *hv = getenv("S2A_PW_HEAP");
+    const int want_heap = hv && *hv ? atoi(hv) != 0 : 1;
+    char path[600];
+    if (file_path(path, sizeof path)) return 2;
+    unsigned char *buf = NULL;
+    long n = 0;
+    if (read_all(path, &buf, &n) != 0 || n < 32 + 32 + NVK_PW_DESC_BYTES + 4) { free(buf); fprintf(stderr, "FAIL victim wrap: the phase 2 list is missing or too short (%ld bytes)\n", n); return 2; }
+    int r0 = -1;
+    for (int r = 0; r < VIC_NREC && r0 < 0; r++) {   // 第 0 条是哪份配方：用生成器重新出一遍紧凑配方，按（程序身份 + 配方字节）认
+        nvn_gpu_pipe_desc d;
+        struct nvk_pipe_rec rec;
+        tag_recipe(&d, r);
+        prog_setup((uint8_t)(0x30 + (r & 1)));
+        nvk_pipe_warm_rec_of(&d, g_prog.identity, &rec);
+        if (memcmp(rec.prog_identity, buf + 32, 32) == 0 && memcmp(rec.desc, buf + 32 + 32, NVK_PW_DESC_BYTES) == 0) r0 = r;
+    }
+    free(buf);
+    CHECK(r0 >= 0, "victim wrap: entry 0 of the list must be one of the %d generated recipes", VIC_NREC);
+    if (r0 < 0) return g_fail;
+    const int ld = nvk_pipe_warm_load();
+    CHECK(ld > 0 && ld <= cap, "victim wrap: the patched list must load (<= cap %d), got %d", cap, ld);
+    CHECK(nvk_pipe_warm_test_victim_check() == 0, "victim wrap: right after load the heap check must hold, item %d", nvk_pipe_warm_test_victim_check());
+    CHECK(nvk_pipe_warm_test_heap_stale() == (want_heap ? 0 : -1), "victim wrap: right after load every stored key must equal the real key (heap arm 0, scan arm -1), got %d", nvk_pipe_warm_test_heap_stale());
+    tag_note(0, r0);   // 完整路径命中第 0 条：uses 4294967295 → 0
+    CHECK(nvk_pipe_warm_test_heap_stale() == (want_heap ? 0 : -1), "victim wrap: the key went DOWN at the wrap, the stored key must follow it at once (heap arm 0, scan arm -1), got %d", nvk_pipe_warm_test_heap_stale());
+    CHECK(nvk_pipe_warm_test_victim_check() == 0, "victim wrap: after the uses wrap (4294967295 -> 0) the heap check failed, item %d", nvk_pipe_warm_test_victim_check());
+    tag_note(0, r0);   // 再命中一次：uses 0 → 1 只增不减，热路径不动堆，存的键落后一条（恰这一槽）
+    CHECK(nvk_pipe_warm_test_heap_stale() == (want_heap ? 1 : -1), "victim wrap: a plain hit must leave the heap alone, exactly the hit slot is stale (heap arm 1, scan arm -1), got %d", nvk_pipe_warm_test_heap_stale());
+    CHECK(nvk_pipe_warm_test_victim_check() == 0, "victim wrap: after a plain hit the heap check failed, item %d", nvk_pipe_warm_test_victim_check());
+    for (int j = 0; j < 40 && !g_fail; j++) {
+        tag_note(0, VIC_NREC + j);
+        const int vc = nvk_pipe_warm_test_victim_check();
+        CHECK(vc == 0, "victim wrap: cap %d new recipe #%d: the heap check failed (item %d)", cap, j, vc);
+    }
+    CHECK(nvk_pipe_warm_test_vmode() == (want_heap ? 1 : 0), "victim wrap: this arm must use the %s path, vmode=%d", want_heap ? "heap" : "scan", nvk_pipe_warm_test_vmode());
+    nvk_pipe_warm_save();
+    return g_fail;
+}
+
 // ---- 模式：清单颠簸 / 逐帧变化量诊断（#1372）----
 // 计数与日志只读、不改清单。期望全部按规则手算，不拿被测实现推。开关缺省 0（玩家包恒如此）；
 // 用例在模式内置环境变量（模块第一次 note 才读开关 / 上限）。窗口行靠 nvk_pipe_warm_diag_flush 立刻出，不等 5 秒。
@@ -1234,8 +1321,66 @@ static int diag_equiv(const char *self, const char *base) {
     return fail;
 }
 
+// 淘汰堆与整表线性扫：同一串 note、两个阶段（空目录起跑 / 载入上一阶段清单后接着跑），两条路径落盘逐字节相同。
+// 「整表线性扫」臂 = S2A_PW_HEAP=0；「堆」臂 = 开关根本不设（玩家包永远是这个状态，走代码里的缺省值）。返回 0 = 全部通过。
+// 把清单第 0 条（uses 最大）的 uses 改成 4294967295，并按盘上格式重算整份校验和（头 32 字节；校验和在 24..31，覆盖头之后的全部内容）。0 = 成功。
+static int patch_uses_max(const char *path) {
+    unsigned char *buf = NULL;
+    long n = 0;
+    if (read_all(path, &buf, &n) != 0 || n < 32 + 32 + NVK_PW_DESC_BYTES + 4) { free(buf); return -1; }
+    memset(buf + 32 + 32 + NVK_PW_DESC_BYTES, 0xff, 4);
+    uint64_t h = 1469598103934665603ull;
+    for (long i = 32; i < n; i++) h = (h ^ buf[i]) * 1099511628211ull;
+    for (int i = 0; i < 8; i++) buf[24 + i] = (unsigned char)(h >> (8 * i));
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(buf); return -1; }
+    const int ok = fwrite(buf, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    free(buf);
+    return ok ? 0 : -1;
+}
+
+static int victim_equiv(const char *self, const char *base) {
+    static const int caps[3] = {24, 5, 200};
+    int fail = 0;
+    for (int v = 0; v < 3; v++) {
+        char dir[2][600], file[2][700], ph[24];
+        unsigned char *p[3][2] = {{NULL, NULL}, {NULL, NULL}, {NULL, NULL}};
+        long n[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+        for (int arm = 0; arm < 2; arm++) {
+            snprintf(dir[arm], sizeof dir[arm], "%s/vic%d-%s", base, v, arm ? "heap" : "scan");
+            mkdir(dir[arm], 0700);
+            snprintf(file[arm], sizeof file[arm], "%.500s/pipes-v1-%d.bin", dir[arm], NVK_PW_DESC_BYTES);
+            unlink(file[arm]);
+            setenv("S2A_PW_DIR", dir[arm], 1);
+            if (arm == 0) setenv("S2A_PW_HEAP", "0", 1); else unsetenv("S2A_PW_HEAP");
+            for (int phase = 1; phase <= 3; phase++) {
+                if (phase == 3 && patch_uses_max(file[arm]) != 0) { fprintf(stderr, "FAIL victim: cannot patch the phase 2 list (cap %d, %s arm)\n", caps[v], arm ? "heap" : "scan"); fail = 1; break; }
+                snprintf(ph, sizeof ph, "%d,%d", phase, caps[v]);
+                const int rc = run_child(self, "victim_run", ph);
+                (void)read_all(file[arm], &p[phase - 1][arm], &n[phase - 1][arm]);
+                if (rc != 0) { fprintf(stderr, "FAIL victim child phase %d (cap %d, %s arm) rc=%d\n", phase, caps[v], arm ? "heap" : "scan", rc); fail = 1; break; }
+            }
+        }
+        unsetenv("S2A_PW_HEAP");
+        setenv("S2A_PW_DIR", base, 1);
+        int same[3];
+        for (int k = 0; k < 3; k++) same[k] = p[k][0] && p[k][1] && n[k][0] > 32 && n[k][0] == n[k][1] && memcmp(p[k][0], p[k][1], (size_t)n[k][0]) == 0;
+        printf("victim/cap%-3d 阶段 1 清单 %ld 字节 %s；阶段 2（载入后接着跑）%ld 字节 %s；阶段 3（uses 回绕后接着跑）%ld 字节 %s\n",
+               caps[v], n[0][0], same[0] ? "逐字节相同" : "不同", n[1][0], same[1] ? "逐字节相同" : "不同", n[2][0], same[2] ? "逐字节相同" : "不同");
+        if (!same[0] || !same[1] || !same[2]) fail = 1;
+        for (int arm = 0; arm < 2; arm++) { for (int k = 0; k < 3; k++) free(p[k][arm]); unlink(file[arm]); rmdir(dir[arm]); }
+    }
+    return fail;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "badfile")) return mode_badfile(argv[2]) ? 1 : 0;
+    if (argc >= 3 && !strcmp(argv[1], "victim_run")) {
+        int ph = 0, cap = 0;
+        if (sscanf(argv[2], "%d,%d", &ph, &cap) != 2 || ph < 1 || ph > 3 || cap < 1) return 2;
+        return (ph == 3 ? mode_victim_wrap(cap) : mode_victim_run(ph, cap)) ? 1 : 0;
+    }
     if (argc >= 3 && (!strcmp(argv[1], "tag_old") || !strcmp(argv[1], "tag_new"))) return mode_tag(!strcmp(argv[1], "tag_new"), atoi(argv[2])) ? 1 : 0;
     if (argc >= 2) {
         const char *m = argv[1];
@@ -1305,6 +1450,12 @@ int main(int argc, char **argv) {
         printf("%-8s %s\n", "diag_eq", rc == 0 ? "ok" : "FAIL");
         if (rc != 0) fail = 1;
     }
-    printf("%s\n", fail ? "FAIL" : "PASS 主机管道：逐字段往返 / 去重 uses / 散列碰撞不去重 / 上限淘汰（含缺省 8192 与硬顶）/ 跨会话清单 / 坏文件整份拒绝 / 本局预热集冻结 / 程序借用不泄漏 / 并发保存不损坏 / 管线标签路径与完整路径清单逐字节相同（含淘汰、最近序号、重载、换程序身份）/ 颠簸与逐帧变化量诊断计数（含负对照、淘汰集合清空、并发守恒、日志与比对在清单锁外、缺省关且开关不改落盘）");
+    {   // 淘汰堆与整表线性扫：同一串 note、两个阶段，落盘逐字节相同（只换挑牺牲者的办法，不改清单内容）
+        // 同上一块：传拷下来的 base，victim_equiv 里 setenv 会改写 S2A_PW_DIR，getenv 返回的指针在 macOS 上会悬空
+        int rc = victim_equiv(argv[0], base);
+        printf("%-8s %s\n", "victim_eq", rc == 0 ? "ok" : "FAIL");
+        if (rc != 0) fail = 1;
+    }
+    printf("%s\n", fail ? "FAIL" : "PASS 主机管道：逐字段往返 / 去重 uses / 散列碰撞不去重 / 上限淘汰（含缺省 8192 与硬顶）/ 跨会话清单 / 坏文件整份拒绝 / 本局预热集冻结 / 程序借用不泄漏 / 并发保存不损坏 / 管线标签路径与完整路径清单逐字节相同（含淘汰、最近序号、重载、换程序身份）/ 颠簸与逐帧变化量诊断计数（含负对照、淘汰集合清空、并发守恒、日志与比对在清单锁外、缺省关且开关不改落盘）/ 淘汰堆与整表线性扫落盘逐字节相同（含载入后重建、含不淘汰与小上限、含 uses 回绕）");
     return fail;
 }

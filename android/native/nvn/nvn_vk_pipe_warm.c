@@ -80,6 +80,17 @@ static struct pw_state {
     int32_t *bucket;        // 桶头（-1 空）
     uint8_t *used;          // 槽位占用位
     int32_t *order;         // take / 落盘的顺序（uses 降序、同 uses 最近优先）
+    // 淘汰堆：最小堆，元素是槽号，键 = (uses, seen, 槽号) 升序，堆顶 = 淘汰目标（uses 最小、同 uses 最久没用）。
+    // 满表之后每新记一条都要选牺牲者，整表线性扫是 O(容量)，堆是 O(层数)。vmode 为 0 时不维护（旧路径，A/B 与用例参照用）。
+    // 懒更新：堆按「存的键」hk 排序，命中（uses++ / 刷新最近序号）只改槽里的 uses / seen、不动堆（热路径一次比较）；
+    // 键只增不减，所以 hk ≤ 真键；选牺牲者时堆顶的 hk 与真键不等（命中过）就刷新 hk、下沉，直到堆顶 hk = 真键：
+    // 此时它的真键 ≤ 其余所有 hk ≤ 其余所有真键，就是整表线性扫会选的那个。
+    int32_t *heap;
+    uint64_t *hk;           // 槽号 → 存的键 = uses << 32 | seen（与真键同序：uses 高位在前、同 uses 比 seen）
+    int32_t *hpos;          // 槽号 → 堆内下标
+    uint32_t heap_n;        // 堆内条数（= 已占槽数；槽只被占、不被放空，载入时整体重建）
+    uint32_t free_next;     // 第一个空槽的下标提示（槽只被占、不被放空，所以只增；载入时归零）
+    int vmode;              // 1 = 堆（缺省）；0 = 整表线性扫（debug.s2a.nvk_pw_heap=0）
     uint64_t order_gen, note_gen;
     uint64_t clock;         // 单调使用序号
     uint64_t dirty;
@@ -266,12 +277,16 @@ static int pw_init_locked(void) {
     g.next = calloc(g.cap, sizeof *g.next);
     g.used = calloc(g.cap, 1);
     g.order = calloc(g.cap, sizeof *g.order);
+    g.heap = calloc(g.cap, sizeof *g.heap);
+    g.hpos = calloc(g.cap, sizeof *g.hpos);
+    g.hk = calloc(g.cap, sizeof *g.hk);
     g.bucket = malloc((size_t)nb * sizeof *g.bucket);
-    if (!g.recs || !g.uses || !g.seen || !g.gen || !g.hash || !g.next || !g.used || !g.order || !g.bucket) {
-        free(g.recs); free(g.uses); free(g.seen); free(g.gen); free(g.hash); free(g.next); free(g.used); free(g.order); free(g.bucket);
-        g.recs = NULL; g.uses = NULL; g.seen = NULL; g.gen = NULL; g.hash = NULL; g.next = NULL; g.used = NULL; g.order = NULL; g.bucket = NULL;
+    if (!g.recs || !g.uses || !g.seen || !g.gen || !g.hash || !g.next || !g.used || !g.order || !g.heap || !g.hk || !g.hpos || !g.bucket) {
+        free(g.recs); free(g.uses); free(g.seen); free(g.gen); free(g.hash); free(g.next); free(g.used); free(g.order); free(g.heap); free(g.hk); free(g.hpos); free(g.bucket);
+        g.recs = NULL; g.uses = NULL; g.seen = NULL; g.gen = NULL; g.hash = NULL; g.next = NULL; g.used = NULL; g.order = NULL; g.heap = NULL; g.hk = NULL; g.hpos = NULL; g.bucket = NULL;
         return -1;
     }
+    g.vmode = nvn_plat_flag("nvk_pw_heap", 1) != 0;   // 缺省 1（玩家包恒如此）；调试包 debug.s2a.nvk_pw_heap=0 回到整表线性扫
     for (uint32_t i = 0; i < nb; i++) g.bucket[i] = -1;
     for (uint32_t i = 0; i < g.cap; i++) g.next[i] = -1;
     for (int i = 0; i < NVK_PW_MEMO; i++) g.memo[i].slot = -1;
@@ -533,8 +548,17 @@ static void pw_dg_out_run(const struct pw_dg_out *o) {
     if (o->sample) pw_dg_sample_run(o);
 }
 
-// 淘汰目标：uses 最小，同 uses 取最久没用的。
-static uint32_t pw_victim_locked(void) {
+// 淘汰目标：uses 最小，同 uses 取最久没用的（都相同取下标小的）。这是一个全序：整表线性扫和堆用同一个比较
+// （键 = uses << 32 | seen：u64 比大小与「先比 uses、再比 seen」同序，两个 u32 各自回绕之后也一致），
+// 所以两条路径选出同一个槽，落盘清单逐字节相同。
+static uint64_t pw_rk(uint32_t s) { return ((uint64_t)g.uses[s] << 32) | (uint64_t)g.seen[s]; }   // 真键：槽里现在的 uses / seen
+static int pw_hk_before(uint32_t a, uint32_t b) {   // 堆按存的键排序（下标小的在前打平）
+    if (g.hk[a] != g.hk[b]) return g.hk[a] < g.hk[b];
+    return a < b;
+}
+
+// 旧路径：整表线性扫，O(容量)。vmode 为 0 时就用它；堆路径的参照（用例钩子）也是它。
+static uint32_t pw_victim_scan_locked(void) {
     uint32_t best = 0;
     for (uint32_t i = 0; i < g.cap; i++) {
         if (!g.used[i]) return i;
@@ -542,6 +566,55 @@ static uint32_t pw_victim_locked(void) {
         if (g.uses[i] < g.uses[best] || (g.uses[i] == g.uses[best] && g.seen[i] < g.seen[best])) best = i;
     }
     return best;
+}
+
+// 堆（按存的键 hk）：键变小（新放进末尾 / 淘汰重用后键比原来小 / uses 回绕）要上浮，键变大（淘汰重用后键变大 / 选牺牲者时刷新了堆顶的键）要下沉。
+static void pw_heap_up_locked(uint32_t i) {
+    const int32_t s = g.heap[i];
+    while (i > 0) {
+        const uint32_t p = (i - 1) >> 1;
+        const int32_t ps = g.heap[p];
+        if (!pw_hk_before((uint32_t)s, (uint32_t)ps)) break;
+        g.heap[i] = ps; g.hpos[ps] = (int32_t)i;
+        i = p;
+    }
+    g.heap[i] = s; g.hpos[s] = (int32_t)i;
+}
+
+static void pw_heap_down_locked(uint32_t i) {
+    const int32_t s = g.heap[i];
+    const uint32_t n = g.heap_n;
+    for (;;) {
+        uint32_t c = 2 * i + 1;
+        if (c >= n) break;
+        if (c + 1 < n && pw_hk_before((uint32_t)g.heap[c + 1], (uint32_t)g.heap[c])) c++;
+        if (!pw_hk_before((uint32_t)g.heap[c], (uint32_t)s)) break;
+        g.heap[i] = g.heap[c]; g.hpos[g.heap[i]] = (int32_t)i;
+        i = c;
+    }
+    g.heap[i] = s; g.hpos[s] = (int32_t)i;
+}
+
+// 载入之后整体重建（Floyd，O(条数)）：槽里的 uses / seen 刚被整份换过，存的键一并刷成真键。
+static void pw_heap_rebuild_locked(void) {
+    g.heap_n = 0;
+    for (uint32_t i = 0; i < g.cap; i++) if (g.used[i]) { g.hk[i] = pw_rk(i); g.heap[g.heap_n] = (int32_t)i; g.hpos[i] = (int32_t)g.heap_n; g.heap_n++; }
+    for (uint32_t i = g.heap_n / 2; i-- > 0;) pw_heap_down_locked(i);
+}
+
+static uint32_t pw_victim_locked(void) {
+    if (!g.vmode) return pw_victim_scan_locked();
+    if (g.count < g.cap) {   // 还有空槽：取第一个空槽（整表线性扫碰到的第一个空槽，同一个）。槽只被占、不被放空，提示只增。
+        while (g.free_next < g.cap && g.used[g.free_next]) g.free_next++;
+        return g.free_next;
+    }
+    for (;;) {   // 满了：堆顶的存的键等于真键才算数；命中过的（存的键落后）刷成真键、下沉，再看新的堆顶（每次刷新一个槽，次数有限）
+        const uint32_t r = (uint32_t)g.heap[0];
+        const uint64_t k = pw_rk(r);
+        if (g.hk[r] == k) return r;   // 它的真键 = 存的键 ≤ 其余所有存的键 ≤ 其余所有真键：就是整表线性扫会选的那个
+        g.hk[r] = k;
+        pw_heap_down_locked(0);
+    }
 }
 
 // 槽代号：槽里每换一份配方就取一个新值（0 不发）。标签 = 代号 << 32 | (槽号 + 1)，所以 0 永远不是有效标签。
@@ -555,7 +628,8 @@ static uint32_t pw_insert_locked(const uint8_t *desc, const uint8_t ident[32], u
     const uint64_t dg_t0 = dg.on > 0 ? pw_dg_now() : 0;
     uint32_t slot = pw_victim_locked();
     if (dg.on > 0) { dg.c.scans++; dg.c.scan_ns += pw_dg_now() - dg_t0; }   // 诊断：只计数，不影响上面的选择
-    if (g.used[slot]) {
+    const int reused = g.used[slot];
+    if (reused) {
         if (dg.on > 0) { dg.c.evicts++; pw_dg_ev_add(g.hash[slot]); }      // 诊断：记下被淘汰配方的散列（覆盖之前读）
         __atomic_fetch_add(&g.st.rejected, 1, __ATOMIC_RELAXED);   // 上限满了淘汰最冷的：不拒绝新配方，代价记在这里
         pw_unlink_locked(slot);
@@ -573,6 +647,11 @@ static uint32_t pw_insert_locked(const uint8_t *desc, const uint8_t ident[32], u
     g.gen[slot] = pw_next_gen_locked();
     g.hash[slot] = h;
     g.used[slot] = 1;
+    if (g.vmode) {   // 淘汰堆跟着改
+        g.hk[slot] = pw_rk(slot);
+        if (reused) pw_heap_down_locked(0);   // 只有满表才会重用槽，被重用的就是堆顶：它换成了新配方的键（uses 从 1 起、最近序号最新），往下沉到该去的位置
+        else { g.heap[g.heap_n] = (int32_t)slot; g.hpos[slot] = (int32_t)g.heap_n; g.heap_n++; pw_heap_up_locked(g.heap_n - 1); }   // 新占的空槽放进堆尾再上浮
+    }
     uint32_t b = pw_bucket_of(h, g.nbucket);
     g.next[slot] = g.bucket[b];
     g.bucket[b] = (int32_t)slot;
@@ -587,6 +666,10 @@ static void pw_touch_locked(uint32_t slot) {
     g.seen[slot] = (uint32_t)++g.clock;
     g.recs[slot].uses = g.uses[slot];
     g.dirty = 1;
+    if (g.vmode) {   // 懒更新：键只增不减，存的键 hk 落后于真键没有关系，留到选牺牲者时再刷新，热路径不动堆。
+        const uint64_t k = pw_rk(slot);   // 唯一会变小的情形：uses（u32）回绕成 0，或最近序号回绕 —— 存的键不再是下界，当场刷新并上浮
+        if (k < g.hk[slot]) { g.hk[slot] = k; pw_heap_up_locked((uint32_t)g.hpos[slot]); }
+    }
 }
 
 // ---- 用例 / 诊断入口 ----
@@ -614,6 +697,47 @@ uint64_t nvk_pipe_warm_hash(const struct nvk_pipe_rec *rec) {
 }
 
 void nvk_pipe_warm_test_hash_const(int on) { __atomic_store_n(&g_hash_const, on ? 1 : 0, __ATOMIC_RELEASE); }
+
+// 用例钩子：这一局挑牺牲者走的是哪条路径（1 = 淘汰堆，0 = 整表线性扫；模块还没初始化时给 -1）。
+int nvk_pipe_warm_test_vmode(void) {
+    pthread_mutex_lock(&g.mu);
+    const int v = g.inited ? g.vmode : -1;
+    pthread_mutex_unlock(&g.mu);
+    return v;
+}
+
+// 用例钩子：淘汰堆与整表线性扫核对（见头文件）。0 = 全部成立。
+int nvk_pipe_warm_test_victim_check(void) {
+    int rc = 0;
+    pthread_mutex_lock(&g.mu);
+    if (g.inited) {
+        if (g.vmode) {
+            if (g.heap_n != g.count) rc = 1;
+            for (uint32_t i = 0; !rc && i < g.heap_n; i++) {
+                const int32_t s = g.heap[i];
+                if (s < 0 || (uint32_t)s >= g.cap || !g.used[s] || g.hpos[s] != (int32_t)i) rc = 2;
+                else if (i > 0 && pw_hk_before((uint32_t)s, (uint32_t)g.heap[(i - 1) >> 1])) rc = 3;   // 堆序按存的键
+                else if (g.hk[s] > pw_rk((uint32_t)s)) rc = 5;   // 存的键必须是真键的下界（只增不减；回绕时当场刷新）
+            }
+        }
+        if (!rc && pw_victim_locked() != pw_victim_scan_locked()) rc = 4;
+    }
+    pthread_mutex_unlock(&g.mu);
+    return rc;
+}
+
+// 用例钩子：堆里存的键与真键不等的槽数（命中过、还没等到选牺牲者时才刷新的）。载入 / 新记之后紧接着应为 0，只命中一次应恰为 1
+// （热路径不动堆）；走整表线性扫或模块还没初始化给 -1。
+int nvk_pipe_warm_test_heap_stale(void) {
+    int n = -1;
+    pthread_mutex_lock(&g.mu);
+    if (g.inited && g.vmode) {
+        n = 0;
+        for (uint32_t i = 0; i < g.cap; i++) if (g.used[i] && g.hk[i] != pw_rk(i)) n++;
+    }
+    pthread_mutex_unlock(&g.mu);
+    return n;
+}
 
 // ---- note（提交线程；第一次见到一条管线才走完整路径，之后按管线标签只加计数，见 nvk_pipe_warm_note_prog） ----
 // 完整路径。*tag_out（可为 NULL）= 这份配方在清单里的标签；没收下（没身份 / nspec 非 0 / 分配失败）时给 0。
@@ -944,6 +1068,8 @@ int nvk_pipe_warm_load(void) {
         g.bucket[b] = (int32_t)i;
     }
     g.count = cnt;
+    g.free_next = 0;
+    if (g.vmode) pw_heap_rebuild_locked();   // uses / seen 刚被整份换过：淘汰堆整体重建
     // 冻结本局预热集：文件顺序（uses 降序）= 热点优先的一份值拷贝，之后的 note / 淘汰 / 重排都影响不到它。
     free(g.plan); g.plan = NULL; g.plan_n = g.plan_i = 0;
     if (cnt) {

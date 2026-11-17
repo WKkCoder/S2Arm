@@ -57,6 +57,19 @@ uint64_t nvk_pipe_warm_hash(const struct nvk_pipe_rec *rec);
 // 生产路径不调用它；缺省 0（真散列）。宿主单测 android/tests/nvn_vk_pipe_warm_test.c 用。
 void nvk_pipe_warm_test_hash_const(int on);
 
+// 用例钩子：淘汰堆与整表线性扫核对（满表后每新记一条选牺牲者，缺省走堆，debug.s2a.nvk_pw_heap=0 走整表线性扫）。
+// 持清单锁核对：堆内条数 = 已占槽数；堆与槽位互为反函数；没有哪个节点比父节点「更冷」（按存的键：uses 小、同 uses 更久没用、再同则下标小）；
+// 存的键是真键的下界（命中只改真键、不动堆，所以存的键可以落后，但绝不能比真键大）；
+// 堆路径选出的牺牲者（没满 = 第一个空槽；满了 = 刷掉落后的堆顶之后的堆顶）与整表线性扫选出的是同一个槽。
+// 0 = 全部成立，非 0 = 第几条不成立（1 条数、2 反函数、3 堆序、5 下界、4 牺牲者；检查顺序 1 2 3 5 4）。
+// 走整表线性扫时只剩牺牲者那条（两条路径是同一个函数，恒成立）。生产路径不调用它。
+int nvk_pipe_warm_test_victim_check(void);
+// 用例钩子：堆里存的键与真键不等的槽数（命中只改真键、不动堆，等选牺牲者时才刷新）。载入 / 新记之后紧接着 0，只命中一次恰为 1；
+// 走整表线性扫（或模块还没初始化）给 -1。
+int nvk_pipe_warm_test_heap_stale(void);
+// 用例钩子：这一局挑牺牲者走的路径：1 = 淘汰堆（缺省），0 = 整表线性扫，-1 = 模块还没初始化。
+int nvk_pipe_warm_test_vmode(void);
+
 int nvk_pipe_warm_load(void);        // 开局读清单 + 整份校验；返回可用条数（<0 = 关闭/失败）
 int nvk_pipe_warm_take(struct nvk_pipe_rec *out);
 int nvk_pipe_warm_pending(void);
