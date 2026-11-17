@@ -893,12 +893,12 @@ static int mode_tag_twin(void) {
 }
 
 // ---- 模式：淘汰堆与整表线性扫出同一份清单 ----
-// 满表之后每新记一条都要挑牺牲者（uses 最小、同 uses 最久没用）。缺省走淘汰堆（O(层数)），S2A_PW_HEAP=0 走原来的整表线性扫（O(容量)）。
+// 满表之后每新记一条都要挑牺牲者（uses 最小、同 uses 最久没用）。缺省走淘汰堆（命中不动堆，挑牺牲者时才把落后的键刷新，摊还 O(层数)），S2A_PW_HEAP=0 走原来的整表线性扫（O(容量)）。
 // 同一串 note（6 个热配方 / 30 个中等 / 共 64 种，上限 24 / 5 / 200：前两档槽不断被淘汰重用，第三档不淘汰），分三个阶段、各在自己的进程里跑：
 //   阶段 1：空目录起跑，note 4000 步，落盘；阶段 2：新进程先载入阶段 1 的清单（淘汰堆整体重建），再 note 4000 步（另一个种子），落盘；
 //   阶段 3：uses 回绕（见 mode_victim_wrap）。
 // 父进程把「缺省」与「S2A_PW_HEAP=0」各跑一遍，逐字节比三个阶段的清单文件（条数、各条 uses、顺序都在文件里）。
-// 每一步之后都核对堆性质，以及堆选出的牺牲者与整表线性扫选出的是同一个槽（nvk_pipe_warm_test_victim_check）；
+// 每一步之后都核对堆性质（按存的键）、存的键是真键的下界，以及堆选出的牺牲者与整表线性扫选出的是同一个槽（nvk_pipe_warm_test_victim_check）；
 // 并核对这一臂走的确实是它该走的路径（缺省臂必须是堆：把缺省值写反的实现不会靠「两臂都走线性扫」蒙混过去）。
 enum { VIC_STEPS = 4000, VIC_NREC = 64 };
 static int mode_victim_run(int phase, int cap) {
@@ -1321,8 +1321,6 @@ static int diag_equiv(const char *self, const char *base) {
     return fail;
 }
 
-// 淘汰堆与整表线性扫：同一串 note、两个阶段（空目录起跑 / 载入上一阶段清单后接着跑），两条路径落盘逐字节相同。
-// 「整表线性扫」臂 = S2A_PW_HEAP=0；「堆」臂 = 开关根本不设（玩家包永远是这个状态，走代码里的缺省值）。返回 0 = 全部通过。
 // 把清单第 0 条（uses 最大）的 uses 改成 4294967295，并按盘上格式重算整份校验和（头 32 字节；校验和在 24..31，覆盖头之后的全部内容）。0 = 成功。
 static int patch_uses_max(const char *path) {
     unsigned char *buf = NULL;
@@ -1340,6 +1338,8 @@ static int patch_uses_max(const char *path) {
     return ok ? 0 : -1;
 }
 
+// 淘汰堆与整表线性扫：同一串 note、三个阶段（空目录起跑 / 载入上一阶段清单后接着跑 / uses 回绕后接着跑）、三档上限，两条路径落盘逐字节相同。
+// 「整表线性扫」臂 = S2A_PW_HEAP=0；「堆」臂 = 开关根本不设（玩家包永远是这个状态，走代码里的缺省值）。返回 0 = 全部通过。
 static int victim_equiv(const char *self, const char *base) {
     static const int caps[3] = {24, 5, 200};
     int fail = 0;
