@@ -10,7 +10,7 @@
 //   parse_program 同一套接受——命中不等于可绘制（与 offline_library.h 同一口径）。
 // 计数口径：hit = 全部阶段都拿到并合成通过；miss = 包不在/键不在/缺 json 或 spv/
 //   程序含 vk 库不出的阶段（tcs/tes）/ 几何程序而设备没开 geometryShader 或输入图元没有那一份（邻接）；
-//   reject = 容器坏/段越界/json 损坏/键不符/绑定翻译不出的 kind/几何程序写视口号（不静默丢弃）。
+//   reject = 容器坏/段越界/json 损坏/键不符/绑定翻译不出的 kind/几何程序写视口号/vs+fs 接口对不上（不静默丢弃）。
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -51,6 +51,10 @@ int s2a_libpack_get(const struct s2a_libpack *lp, const uint8_t key[8], unsigned
 /* 片元 .spv 的输出映射（同现编结果 info.fragmentOutputMap：每个颜色目标 4 位，第 c 分量 = 位 4×location + c）。
  * 0 = 推出；-1 = 读不懂（数组输出、location ≥ 8 等），调用方不出这一项（消费端按全写）。 */
 int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map);
+/* 单阶段 .spv 的用户 Location 位图（vs+fs 接口核对的一半）：storage_class 1 = Input / 3 = Output，位 L = 入口接口表里的变量占了位置 L
+ * （内建、接口表外的变量不算；数组按元素个数 × 占位、矩阵按列）。0 = 读成了；-1 = 读不懂（没有 Location 又不是内建的变量、
+ * 位置 + 占位 > 64、数组长度不是常量、64 位标量、结构体变量、没有入口、截断），调用方不核、照旧放行。 */
+int s2a_libpack_spv_io_locations(const uint8_t *spv, size_t n, int storage_class, uint64_t *mask);
 // 几何程序（stages 0x7 = vs|fs|gs）要的两样绘制事实；vs+fs 程序不读，可传 NULL（传 NULL 时几何程序 miss）。
 //   topology：绘制图元名，与现编请求 graphicsState.topology 同源（nvk_input_topology：Points / Lines / Triangles / …Adjacency）；
 //   profile_json：本局 effective profile（s2a_direct_compile_context.profile_json），取 capabilities.supportsGeometryShader，
@@ -80,6 +84,7 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
 uint64_t s2a_libpack_hits(void);
 uint64_t s2a_libpack_misses(void);
 uint64_t s2a_libpack_rejects(void);
+uint64_t s2a_libpack_iface_rejects(void);   // 其中因「fs 读了 vs 没写的用户位置」拒的程序数（已计入 rejects；libpack_varying_unlinked）
 uint64_t s2a_libpack_caps_stripped(void);   // 删过用不上的 Float64 / Int64 能力声明的模块条数（libpack_caps_stripped）
 uint64_t s2a_libpack_interlock_dropped(void);   // 真有互锁临界区、去掉互锁照常画的模块条数（libpack_interlock_dropped；本后端从不启用 VK_EXT_fragment_shader_interlock）
 

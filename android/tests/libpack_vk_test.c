@@ -266,6 +266,105 @@ static const uint32_t FO2_SPV[] = {
     0x00000011u, 0x00000002u, 0x00000003u, 0x00050036u, 0x00000006u, 0x00000001u, 0x00000000u, 0x00000007u,
     0x000200f8u, 0x00000012u, 0x000100fdu, 0x00010038u,
 };
+// ---- vs+fs 接口核对（fs 读了 vs 没写的用户位置）用的现造 SPIR-V ----
+// 最小模块：一个空 main + 若干 vec4 的 Input / Output 变量；段顺序按规范（能力 → 内存模型 → 入口 → 执行模式 → 装饰 → 类型 / 变量 → 函数）。
+//   stage：0 = Vertex / 4 = Fragment；in / out：各变量的 Location。变量按「Input（in[]）→ Output（out[]）→ flags 要的额外变量」排，id 从 V0 起。
+#define IOF_DEAD     0x01u   // 最后一个 in[] 变量只声明、不进入口接口表（没被入口引用）
+#define IOF_ARR      0x02u   // 第一个 in[] 变量改声明 vec4[2]（占 L、L+1）
+#define IOF_MAT      0x04u   // 第一个 in[] 变量改声明 mat4（占 L..L+3）
+#define IOF_BUILTIN  0x08u   // 额外一个 Input 内建变量（BuiltIn FragCoord，进接口表）
+#define IOF_NOLOC    0x10u   // 额外一个没有 Location 的非内建 Input（进接口表）
+#define IOF_NOLOC_O  0x20u   // 额外一个没有 Location 的非内建 Output（进接口表）
+#define IOF_WIDE     0x40u   // 额外一个 Input：Location 0 的 64 位浮点二维向量
+#define IOF_STRUCT   0x80u   // 额外一个 Input：Location 0 的普通结构体（没有内建成员）
+struct io_var { uint32_t ptr_ty, sc; int loc, builtin; };   // loc < 0：不写 Location 装饰
+static size_t io_mod(uint32_t *m, int stage, const int *in, int nin, const int *out, int nout, unsigned flags) {
+    enum { MAIN = 1, VOID_, FNTY, FLOAT, VEC4, PIN, POUT, UINT, TWO, ARR, PINARR, MAT4, PINMAT, F64, DVEC2, PINDV, STR, PINST, LABEL, V0 = 24 };
+    struct io_var vars[32]; int nvar = 0, dead = -1;
+    for (int i = 0; i < nin; i++) {
+        const uint32_t ty = i == 0 && (flags & IOF_ARR) ? PINARR : i == 0 && (flags & IOF_MAT) ? PINMAT : PIN;
+        vars[nvar++] = (struct io_var){ ty, 1u, in[i], 0 };
+    }
+    if ((flags & IOF_DEAD) && nin > 0) dead = nin - 1;
+    for (int i = 0; i < nout; i++) vars[nvar++] = (struct io_var){ POUT, 3u, out[i], 0 };
+    if (flags & IOF_BUILTIN) vars[nvar++] = (struct io_var){ PIN, 1u, -1, 1 };
+    if (flags & IOF_NOLOC)   vars[nvar++] = (struct io_var){ PIN, 1u, -1, 0 };
+    if (flags & IOF_NOLOC_O) vars[nvar++] = (struct io_var){ POUT, 3u, -1, 0 };
+    if (flags & IOF_WIDE)    vars[nvar++] = (struct io_var){ PINDV, 1u, 0, 0 };
+    if (flags & IOF_STRUCT)  vars[nvar++] = (struct io_var){ PINST, 1u, 0, 0 };
+    size_t k = 0;
+    m[k++] = 0x07230203u; m[k++] = 0x00010300u; m[k++] = 0u; m[k++] = (uint32_t)(V0 + nvar); m[k++] = 0u;
+    m[k++] = 0x00020011u; m[k++] = 1u;                                         // OpCapability Shader
+    m[k++] = 0x0003000eu; m[k++] = 0u; m[k++] = 1u;                            // OpMemoryModel Logical GLSL450
+    m[k++] = (uint32_t)(5 + nvar - (dead >= 0)) << 16 | 15u; m[k++] = stage ? 4u : 0u; m[k++] = MAIN;   // OpEntryPoint 模型 %main "main" 接口…
+    m[k++] = 0x6e69616du; m[k++] = 0u;
+    for (int v = 0; v < nvar; v++) if (v != dead) m[k++] = (uint32_t)(V0 + v);
+    if (stage) { m[k++] = 0x00030010u; m[k++] = MAIN; m[k++] = 7u; }          // OpExecutionMode %main OriginUpperLeft
+    for (int v = 0; v < nvar; v++) {
+        if (vars[v].loc >= 0) { m[k++] = 0x00040047u; m[k++] = (uint32_t)(V0 + v); m[k++] = 30u; m[k++] = (uint32_t)vars[v].loc; }   // Location
+        if (vars[v].builtin)  { m[k++] = 0x00040047u; m[k++] = (uint32_t)(V0 + v); m[k++] = 11u; m[k++] = 15u; }                      // BuiltIn FragCoord
+    }
+    m[k++] = 0x00020013u; m[k++] = VOID_;
+    m[k++] = 0x00030021u; m[k++] = FNTY; m[k++] = VOID_;
+    m[k++] = 0x00030016u; m[k++] = FLOAT; m[k++] = 32u;
+    m[k++] = 0x00040017u; m[k++] = VEC4; m[k++] = FLOAT; m[k++] = 4u;
+    m[k++] = 0x00040020u; m[k++] = PIN; m[k++] = 1u; m[k++] = VEC4;
+    m[k++] = 0x00040020u; m[k++] = POUT; m[k++] = 3u; m[k++] = VEC4;
+    m[k++] = 0x00040015u; m[k++] = UINT; m[k++] = 32u; m[k++] = 0u;
+    m[k++] = 0x0004002bu; m[k++] = UINT; m[k++] = TWO; m[k++] = 2u;
+    m[k++] = 0x0004001cu; m[k++] = ARR; m[k++] = VEC4; m[k++] = TWO;           // vec4[2]
+    m[k++] = 0x00040020u; m[k++] = PINARR; m[k++] = 1u; m[k++] = ARR;
+    m[k++] = 0x00040018u; m[k++] = MAT4; m[k++] = VEC4; m[k++] = 4u;           // mat4（OpTypeMatrix 列类型 列数）
+    m[k++] = 0x00040020u; m[k++] = PINMAT; m[k++] = 1u; m[k++] = MAT4;
+    m[k++] = 0x00030016u; m[k++] = F64; m[k++] = 64u;
+    m[k++] = 0x00040017u; m[k++] = DVEC2; m[k++] = F64; m[k++] = 2u;
+    m[k++] = 0x00040020u; m[k++] = PINDV; m[k++] = 1u; m[k++] = DVEC2;
+    m[k++] = 0x0003001eu; m[k++] = STR; m[k++] = VEC4;                          // struct { vec4 }
+    m[k++] = 0x00040020u; m[k++] = PINST; m[k++] = 1u; m[k++] = STR;
+    for (int v = 0; v < nvar; v++) { m[k++] = 0x0004003bu; m[k++] = vars[v].ptr_ty; m[k++] = (uint32_t)(V0 + v); m[k++] = vars[v].sc; }
+    m[k++] = 0x00050036u; m[k++] = VOID_; m[k++] = MAIN; m[k++] = 0u; m[k++] = FNTY;   // OpFunction
+    m[k++] = 0x000200f8u; m[k++] = LABEL; m[k++] = 0x000100fdu; m[k++] = 0x00010038u;  // OpLabel / OpReturn / OpFunctionEnd
+    return k;
+}
+#define IO_JSON(stage, key) "{\"key\":\"" key "_b\",\"stage\":\"" stage "\",\"dm_ctl\":\"" key "\",\"bindings\":[]}"
+// vs / fs 两个模块写成一个小容器（键同上面样例），取 vs+fs 程序；返回 s2a_libpack_program_v1 的返回值。REJECT / MISS 不许带结果字节。
+static int io_pair(const char *base, int id, const uint32_t *vs, size_t vn, const uint32_t *fs, size_t fn, char *why, size_t wn) {
+    snprintf(g_dir, sizeof g_dir, "%s/io%d", base, id);
+    mkdir(g_dir, 0700);
+    static const char vj[] = IO_JSON("vs", "0123456789abcdef"), pj[] = IO_JSON("ps", "1032547698badcfe");
+    struct trec recs[4] = {
+        { .key = 0x0123456789abcdef, .kind = 1,  .len = sizeof vj - 1 },
+        { .key = 0x0123456789abcdef, .kind = 52, .len = (uint32_t)(vn * 4) },
+        { .key = 0x1032547698badcfe, .kind = 1,  .len = sizeof pj - 1 },
+        { .key = 0x1032547698badcfe, .kind = 52, .len = (uint32_t)(fn * 4) },
+    };
+    const uint8_t *pl[4] = { (const uint8_t *)vj, (const uint8_t *)vs, (const uint8_t *)pj, (const uint8_t *)fs };
+    size_t pln[4] = { sizeof vj - 1, vn * 4, sizeof pj - 1, fn * 4 };
+    int rc = -9;
+    struct s2a_libpack *lp = NULL;
+    if (mk_pack(recs, 4, pl, pln, 1) == 0 && s2a_libpack_open(&lp, g_dir) == 1) {
+        uint8_t keys[6][8] = {{0}}, *j = NULL; size_t jl = 0;
+        const uint8_t kv[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }, kp[8] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe };
+        memcpy(keys[0], kv, 8); memcpy(keys[1], kp, 8);
+        why[0] = 0;
+        rc = s2a_libpack_program_v1(lp, keys, 0x3, NULL, 1, "h", "c", &j, &jl, why, wn);
+        CHECK(rc == 0 ? j != NULL : j == NULL, "vs+fs 接口核：HIT 带结果字节、REJECT 不带");
+        free(j);
+    }
+    s2a_libpack_close(lp);
+    char p[400];
+    snprintf(p, sizeof p, "%s/lib.idx", g_dir); unlink(p);
+    snprintf(p, sizeof p, "%s/lib.000.pak", g_dir); unlink(p);
+    rmdir(g_dir);
+    return rc;
+}
+// vs 声明 vin 个 Input、vout 个 Output，fs 声明 fin 个 Input；见 io_mod 的 flags
+static int io_case(const char *base, int id, const int *vin, int nvi, const int *vout, int nvo, unsigned vf,
+                   const int *fin, int nfi, unsigned ff, char *why, size_t wn) {
+    uint32_t vs[160], fs[160];
+    const size_t vn = io_mod(vs, 0, vin, nvi, vout, nvo, vf), fn = io_mod(fs, 4, fin, nfi, NULL, 0, ff);
+    return io_pair(base, id, vs, vn, fs, fn, why, wn);
+}
 int main(void) {
     const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
     char tmpl[TMPL_CAP];
@@ -1130,6 +1229,84 @@ int main(void) {
         CHECK(s2a_libpack_spv_admit_caps((uint8_t *)f, &n, cw, sizeof cw) == 0 && n == wk * 4 && !memcmp(f, want, wk * 4),
               "像素锁：有临界区 → 不拒收，两条互锁指令也删，结果同上");
         CHECK(s2a_libpack_interlock_dropped() == i0 + 1 && s2a_libpack_caps_stripped() == c0 + 2, "像素锁：有临界区 → 丢互锁计 1 条（libpack_interlock_dropped）");
+    }
+    {   // vs+fs 接口核对：库里的 vs / fs 逐键独立翻，拼成的程序里 fs 读了 vs 没写的用户位置，Adreno 建管线时直接拒（#999 的 11 对）。
+        //   读得懂又对不上 → REJECT（退回现编，现编会补写缺的位置）；对得上、读不懂 → 照旧放行（不拦认不出的）。期望值按位置号手算
+        char base[TMPL_CAP], w[256];
+        if (snprintf(base, sizeof base, "%s/libpack_iface.XXXXXX", tmp) >= (int)sizeof base || !mkdtemp(base)) return 1;
+        const int L0[] = { 0 }, L01[] = { 0, 1 }, L012[] = { 0, 1, 2 }, L02[] = { 0, 2 }, L1[] = { 1 }, L12[] = { 1, 2 }, L13[] = { 1, 3 }, L1234[] = { 1, 2, 3, 4 }, L70[] = { 70 };
+        uint64_t h0 = s2a_libpack_hits(), r0 = s2a_libpack_rejects(), i0 = s2a_libpack_iface_rejects();
+        // 放行：vs 写的是 fs 读的超集 / 恰好相等 / 两边都没有用户位置
+        CHECK(io_case(base, 1, NULL, 0, L012, 3, 0, L02, 2, 0, w, sizeof w) == 0, "接口核：vs 写 {0,1,2} ⊇ fs 读 {0,2} → HIT");
+        CHECK(io_case(base, 2, NULL, 0, L01, 2, 0, L01, 2, 0, w, sizeof w) == 0, "接口核：两边恰好 {0,1} → HIT");
+        CHECK(io_case(base, 3, NULL, 0, NULL, 0, 0, NULL, 0, 0, w, sizeof w) == 0, "接口核：两边都没有用户位置 → HIT");
+        CHECK(s2a_libpack_hits() == h0 + 3 && s2a_libpack_rejects() == r0 && s2a_libpack_iface_rejects() == i0, "接口核：三条放行只计 hit，不计 reject");
+        // 拒：fs 读了 vs 没写的位置
+        h0 = s2a_libpack_hits(); r0 = s2a_libpack_rejects(); i0 = s2a_libpack_iface_rejects();
+        CHECK(io_case(base, 4, NULL, 0, NULL, 0, 0, L0, 1, 0, w, sizeof w) == S2A_LIBPACK_REJECT
+              && strstr(w, "varying_interface_unlinked") && strstr(w, "unwritten 0x1"),
+              "接口核：vs 没有任何用户输出、fs 读 {0} → REJECT，原因 varying_interface_unlinked，未写位 0x1（#999 里 11 对的形态）");
+        CHECK(io_case(base, 5, NULL, 0, L0, 1, 0, L01, 2, 0, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x2"),
+              "接口核：vs 写 {0}、fs 读 {0,1} → REJECT，未写位 0x2");
+        CHECK(io_case(base, 6, L13, 2, NULL, 0, 0, L1, 1, 0, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x2"),
+              "接口核：vs 的顶点属性 Input {1,3} 不算它写出的位置（Input / Output 不混）→ fs 读 {1} 仍 REJECT");
+        CHECK(s2a_libpack_hits() == h0 && s2a_libpack_rejects() == r0 + 3 && s2a_libpack_iface_rejects() == i0 + 3,
+              "接口核：三条拒各计 reject 与 iface_rejects 一次，不计 hit");
+        // 数组输入占 L..L+元素数-1
+        CHECK(io_case(base, 7, NULL, 0, L1, 1, 0, L1, 1, IOF_ARR, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x4"),
+              "接口核：fs 读 vec4[2] @1（占 1、2），vs 只写 {1} → REJECT，未写位 0x4");
+        CHECK(io_case(base, 8, NULL, 0, L12, 2, 0, L1, 1, IOF_ARR, w, sizeof w) == 0, "接口核：vs 写 {1,2} 盖住数组 → HIT");
+        // 内建 / 接口表外 / 读不懂 → 放行
+        CHECK(io_case(base, 9, NULL, 0, NULL, 0, 0, NULL, 0, IOF_BUILTIN, w, sizeof w) == 0, "接口核：fs 只读内建（FragCoord）→ 不算用户位置，HIT");
+        CHECK(io_case(base, 10, NULL, 0, L1, 1, 0, L13, 2, IOF_DEAD, w, sizeof w) == 0, "接口核：fs 声明的 {3} 不在入口接口表（没被引用）→ 不算，HIT");
+        CHECK(io_case(base, 11, NULL, 0, L1, 1, 0, L13, 2, 0, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x8"),
+              "接口核：同一个 fs 的 {3} 进接口表 → REJECT，未写位 0x8（对上一条的对照）");
+        CHECK(io_case(base, 12, NULL, 0, NULL, 0, 0, L70, 1, 0, w, sizeof w) == 0, "接口核：fs 读 Location 70（超出 64 位位图）→ 读不懂，照旧放行");
+        CHECK(io_case(base, 13, NULL, 0, NULL, 0, 0, NULL, 0, IOF_NOLOC, w, sizeof w) == 0, "接口核：fs 有没标 Location 的非内建输入 → 读不懂，照旧放行");
+        CHECK(io_case(base, 14, NULL, 0, NULL, 0, 0, L1, 1, IOF_BUILTIN, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x2"),
+              "接口核：fs 读 {1} 外加内建 FragCoord、vs 没写 → REJECT（内建不让整个模块变成读不懂）");
+        CHECK(io_case(base, 15, NULL, 0, L0, 1, IOF_NOLOC_O, L01, 2, 0, w, sizeof w) == 0, "接口核：vs 有没标 Location 的输出（读不懂）→ 不核，照旧放行");
+        CHECK(io_case(base, 16, NULL, 0, L12, 2, 0, L1, 1, IOF_MAT, w, sizeof w) == S2A_LIBPACK_REJECT && strstr(w, "unwritten 0x18"),
+              "接口核：fs 读 mat4 @1（按列占 1..4），vs 只写 {1,2} → REJECT，未写位 0x18");
+        CHECK(io_case(base, 17, NULL, 0, L1234, 4, 0, L1, 1, IOF_MAT, w, sizeof w) == 0, "接口核：vs 写 {1,2,3,4} 盖住 mat4 → HIT");
+        rmdir(base);
+        {   // 单阶段位图
+            uint64_t m = 7; uint32_t buf[160]; const int B[] = { 0, 63 }, L63[] = { 63 }, L64[] = { 64 };
+            CHECK(s2a_libpack_spv_io_locations(libpack_vert_spv, sizeof libpack_vert_spv, 1, &m) == 0 && m == 0xA, "位图：样例 vs 的顶点属性 Input（location 1、3）→ 0xA");
+            CHECK(s2a_libpack_spv_io_locations(libpack_vert_spv, sizeof libpack_vert_spv, 3, &m) == 0 && m == 0, "位图：样例 vs 的 Output 只有 gl_PerVertex 块 → 空");
+            m = 7;
+            CHECK(s2a_libpack_spv_io_locations(libpack_frag_spv, sizeof libpack_frag_spv, 3, &m) == 0 && m == 1, "位图：样例 fs 的 Output location 0 → 0x1");
+            CHECK(s2a_libpack_spv_io_locations(libpack_frag_spv, sizeof libpack_frag_spv, 1, &m) == 0 && m == 0, "位图：样例 fs 没有用户 Input → 空");
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)FO1_SPV, sizeof FO1_SPV, 3, &m) == 0 && m == 0xA,
+                  "位图：location 1 + location 3 的 Component 1（不拆位置）+ FragDepth 内建 → 0xA");
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)FO2_SPV, sizeof FO2_SPV, 3, &m) == 0 && m == 0x3,
+                  "位图：vec4[2] @0 占 0、1；该模块的入口接口表只列了这一个变量，另外声明的 @1、@3 不算 → 0x3");
+            m = 7;
+            CHECK(s2a_libpack_spv_io_locations(libpack_vert_spv, 12, 1, &m) == -1 && m == 7, "位图：截断模块 → 读不懂，不动出参");
+            CHECK(s2a_libpack_spv_io_locations(libpack_vert_spv, sizeof libpack_vert_spv, 2, &m) == -1, "位图：存储类不是 Input / Output → 读不懂");
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)CAP_UNUSED_SPV, sizeof CAP_UNUSED_SPV, 1, &m) == -1, "位图：没有入口 → 读不懂");
+            size_t n = io_mod(buf, 4, B, 2, NULL, 0, 0);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == 0 && m == 0x8000000000000001ull, "位图：location 0 与 63 → 位 0 与位 63");
+            n = io_mod(buf, 4, L63, 1, NULL, 0, IOF_ARR);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == -1, "位图：数组 @63 占到 64 → 超出位图，读不懂");
+            n = io_mod(buf, 4, L64, 1, NULL, 0, 0);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == -1, "位图：location 64 → 超出位图，读不懂");
+            n = io_mod(buf, 4, L1, 1, NULL, 0, IOF_BUILTIN);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == 0 && m == 0x2, "位图：location 1 + 内建 FragCoord → 只有位 1（内建不算，也不让模块读不懂）");
+            n = io_mod(buf, 4, L1, 1, NULL, 0, IOF_MAT);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == 0 && m == 0x1E, "位图：mat4 @1 按列占 1..4 → 0x1E");
+            n = io_mod(buf, 4, NULL, 0, NULL, 0, IOF_WIDE);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == -1, "位图：64 位向量输入（占位口径不同）→ 读不懂");
+            n = io_mod(buf, 4, NULL, 0, NULL, 0, IOF_STRUCT);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == -1, "位图：不带内建成员的结构体变量 → 读不懂");
+            n = io_mod(buf, 0, NULL, 0, L0, 1, IOF_NOLOC_O);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 3, &m) == -1
+                  && s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == 0 && m == 0,
+                  "位图：没标 Location 的输出只让 Output 一侧读不懂，Input 一侧照读");
+            n = io_mod(buf, 4, L1, 1, NULL, 0, 0);
+            CHECK(s2a_libpack_spv_io_locations((const uint8_t *)buf, n * 4, 1, &m) == 0 && s2a_libpack_spv_io_locations((const uint8_t *)buf, (n - 7) * 4, 1, &m) == -1,
+                  "位图：指令流在一条指令中间被截断 → 读不懂（整条读得完时照读）");
+        }
     }
     if (fails) { printf("libpack_vk_test: %d FAIL\n", fails); return 1; }
     printf("libpack_vk_test: all checks passed\n");

@@ -43,8 +43,10 @@ static void s2a_lp_red(const char *fmt, ...) {
 
 struct s2a_libpack { lp_pack p; _Atomic int caps_said, ilk_said; };   // ilk_said：本局已打过「丢掉互锁临界区」那一行红   // caps_said：本局（这次 open）已打过「删 64 位能力声明」那一行
 
-static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped, g_interlock_dropped;
+#define LP_IFACE_LOG_MAX 16u   // 接口对不上的拒收，每个进程只打前 16 行日志，之后只计数
+static _Atomic uint64_t g_hits, g_misses, g_rejects, g_caps_stripped, g_interlock_dropped, g_iface_rejects;
 uint64_t s2a_libpack_hits(void) { return atomic_load(&g_hits); }
+uint64_t s2a_libpack_iface_rejects(void) { return atomic_load(&g_iface_rejects); }
 uint64_t s2a_libpack_caps_stripped(void) { return atomic_load(&g_caps_stripped); }
 uint64_t s2a_libpack_interlock_dropped(void) { return atomic_load(&g_interlock_dropped); }
 uint64_t s2a_libpack_misses(void) { return atomic_load(&g_misses); }
@@ -477,6 +479,95 @@ out:
     free(dec); free(ncomp); free(ptr_to);
     return rc;
 }
+// 用户 Location 位图（vs+fs 接口核对的单阶段一半）。库里的 vs / fs 是逐键独立翻的（libpack_vk.h：_b.json 逐键单阶段），拼成 vs+fs 程序时
+//   两边没对过接口；现编（#1273）靠 requires_linked_varying_interface 让 vs 补写「fs 读了、vs 没写」的位置，库拼的程序没有这一步，
+//   而驱动在建管线时核对接口（Adreno：fs 读了前一阶段没声明的 Input 位置 → vkCreateGraphicsPipelines 直接拒，VK_ERROR_UNKNOWN）。
+//   口径：只数入口接口表里的变量（没被入口引用的不算）；变量带 BuiltIn、或块的成员带 BuiltIn（gl_PerVertex）不算；
+//   标量 / 向量占 1 个位置，矩阵按列数，数组 = 元素个数 × 元素占位（位置从 Location 装饰起算）。
+//   0 = 读成了；-1 = 读不懂：没有 Location 又不是内建的变量、位置 + 占位 > 64、数组长度不是常量、64 位标量、
+//   结构体变量（成员 Location）、没有入口、截断的指令流。调用方遇到 -1 不核、照旧放行。
+struct lp_ioty { uint8_t kind, wide; uint32_t a, b; };   // kind：1 标量 / 2 向量 / 3 矩阵 / 4 数组 / 5 结构体；a、b：分量（元素）类型 id、个数（长度常量 id）
+static inline uint32_t lp_rd32(const uint8_t *p, size_t i) { uint32_t v; memcpy(&v, p + i * 4, 4); return v; }
+static int lp_io_slots(const struct lp_ioty *ty, const uint32_t *cval, uint32_t bound, uint32_t t, int depth) {
+    if (t >= bound || depth > 4) return -1;
+    const struct lp_ioty *y = &ty[t];
+    int e;
+    switch (y->kind) {
+    case 1: return y->wide ? -1 : 1;
+    case 2: return y->a < bound && ty[y->a].kind == 1 && !ty[y->a].wide ? 1 : -1;
+    case 3: e = lp_io_slots(ty, cval, bound, y->a, depth + 1); return e < 0 || !y->b || y->b > 4 ? -1 : e * (int)y->b;
+    case 4: {
+        uint32_t len = y->b < bound ? cval[y->b] : 0;
+        e = lp_io_slots(ty, cval, bound, y->a, depth + 1);
+        return e < 0 || !len || len > 64 || (uint64_t)len * (uint32_t)e > 64 ? -1 : (int)(len * (uint32_t)e);
+    }
+    default: return -1;
+    }
+}
+int s2a_libpack_spv_io_locations(const uint8_t *spv, size_t n, int storage_class, uint64_t *mask) {
+    if (!spv || !mask || (storage_class != 1 && storage_class != 3)) return -1;
+    const size_t nw = n / 4;
+    if (nw < 5 || lp_rd32(spv, 0) != 0x07230203u) return -1;
+    const uint32_t bound = lp_rd32(spv, 3);
+    if (!bound || bound > (1u << 22)) return -1;
+    // flag：位 0 变量带 BuiltIn / 位 1 结构体有成员带 BuiltIn / 位 2 结构体有成员带 Location / 位 3 在入口接口表里
+    uint32_t *dloc = calloc(bound, sizeof *dloc), *cval = calloc(bound, sizeof *cval), *ptr_to = calloc(bound, sizeof *ptr_to);
+    uint8_t *flag = calloc(bound, 1);
+    struct lp_ioty *ty = calloc(bound, sizeof *ty);
+    int rc = -1, entry = 0; uint64_t m = 0;
+    if (!dloc || !cval || !ptr_to || !flag || !ty) goto out;
+    for (size_t i = 5; i < nw; ) {
+        const uint32_t h = lp_rd32(spv, i), op = h & 0xffff, wc = h >> 16;
+        if (!wc || i + wc > nw) goto out;
+        if (op == 15) {                                                             // OpEntryPoint 模型 入口 名字… 接口变量…
+            size_t k = i + 3; int term = 0;
+            for (; k < i + wc && !term; k++) {
+                const uint32_t s = lp_rd32(spv, k);
+                term = !(s & 0xffu) || !(s & 0xff00u) || !(s & 0xff0000u) || !(s >> 24);
+            }
+            if (wc < 4 || !term) goto out;
+            for (; k < i + wc; k++) { const uint32_t id = lp_rd32(spv, k); if (id < bound) flag[id] |= 8; }
+            entry = 1;
+        } else if (op == 71 && wc >= 3 && lp_rd32(spv, i + 1) < bound) {            // OpDecorate
+            const uint32_t id = lp_rd32(spv, i + 1), d = lp_rd32(spv, i + 2);
+            if (d == 30 && wc >= 4) { const uint32_t l = lp_rd32(spv, i + 3); if (l >= 0xffffu) goto out; dloc[id] = l + 1; }   // Location
+            else if (d == 11) flag[id] |= 1;                                        // BuiltIn
+        } else if (op == 72 && wc >= 4 && lp_rd32(spv, i + 1) < bound) {            // OpMemberDecorate
+            const uint32_t id = lp_rd32(spv, i + 1), d = lp_rd32(spv, i + 3);
+            if (d == 11) flag[id] |= 2; else if (d == 30) flag[id] |= 4;
+        } else if ((op == 20 || op == 21 || op == 22) && wc >= 2 && lp_rd32(spv, i + 1) < bound) {   // OpTypeBool / Int / Float
+            struct lp_ioty *y = &ty[lp_rd32(spv, i + 1)];
+            y->kind = 1; y->wide = op != 20 && wc >= 3 && lp_rd32(spv, i + 2) > 32;
+        } else if ((op == 23 || op == 24 || op == 28) && wc >= 4 && lp_rd32(spv, i + 1) < bound) {   // OpTypeVector / Matrix / Array
+            struct lp_ioty *y = &ty[lp_rd32(spv, i + 1)];
+            y->kind = op == 23 ? 2 : op == 24 ? 3 : 4; y->a = lp_rd32(spv, i + 2); y->b = lp_rd32(spv, i + 3);
+        } else if (op == 30 && wc >= 2 && lp_rd32(spv, i + 1) < bound) ty[lp_rd32(spv, i + 1)].kind = 5;   // OpTypeStruct
+        else if (op == 43 && wc == 4 && lp_rd32(spv, i + 2) < bound) cval[lp_rd32(spv, i + 2)] = lp_rd32(spv, i + 3);   // OpConstant（单字值）
+        else if (op == 32 && wc >= 4 && lp_rd32(spv, i + 1) < bound) ptr_to[lp_rd32(spv, i + 1)] = lp_rd32(spv, i + 3) + 1;   // OpTypePointer → 指向类型 +1
+        i += wc;
+    }
+    if (!entry) goto out;
+    for (size_t i = 5; i < nw; ) {
+        const uint32_t h = lp_rd32(spv, i), op = h & 0xffff, wc = h >> 16;
+        if (op == 59 && wc >= 4 && lp_rd32(spv, i + 3) == (uint32_t)storage_class) {   // OpVariable 类型 id 存储类
+            const uint32_t pty = lp_rd32(spv, i + 1), id = lp_rd32(spv, i + 2);
+            if (pty >= bound || id >= bound) goto out;
+            if (!(flag[id] & 8) || (flag[id] & 1)) { i += wc; continue; }            // 不在入口接口表 / 内建变量
+            if (!ptr_to[pty] || ptr_to[pty] - 1 >= bound) goto out;
+            const uint32_t val = ptr_to[pty] - 1;
+            if (ty[val].kind == 5) { if (flag[val] & 2) { i += wc; continue; } goto out; }   // 带内建成员的块（gl_PerVertex）不算；别的结构体读不懂
+            if (!dloc[id]) goto out;
+            const int s = lp_io_slots(ty, cval, bound, val, 0);
+            if (s < 0 || dloc[id] - 1 + (uint32_t)s > 64) goto out;
+            for (int k = 0; k < s; k++) m |= 1ull << (dloc[id] - 1 + (uint32_t)k);
+        }
+        i += wc;
+    }
+    *mask = m; rc = 0;
+out:
+    free(dloc); free(cval); free(ptr_to); free(flag); free(ty);
+    return rc;
+}
 // 能力核：离线库的 .spv 是批翻链（translator/dmsh_xlate）按它自己的宿主口径翻的，不是按本机 profile——那边
 //   QueryHostSupportsShaderFloat64 缺省答「有」（Metal 只在模块真用到 double 时重翻），所以几乎每个模块都带 OpCapability Float64。
 //   本后端建设备时从不启用 shaderFloat64 / shaderInt64（direct/vk_device.c enabled_features），模块声明这两项能力就违反
@@ -571,10 +662,12 @@ static int lp_spv_viewport_builtin(const uint8_t *spv, size_t n) {
 //   （倍率恒 1，与机上现编同口径）。只按 2608 绑的话越界读到的是未定义值（设备没开 robustBufferAccess）
 #define LP_SUPPORT_ABI2_BYTES 3776u
 // gs_topology：几何程序的输入图元（InputTopology 编号，见 lp_input_topology），几何段按它取 _vg<t>；不是几何程序给 -1。
+// io：非 NULL 时回填该段 SPIR-V（过完能力核之后的最终字节）的用户 Input / Output 位图，供 vs+fs 接口核对；*_rc 同 s2a_libpack_spv_io_locations（0 读成 / -1 读不懂）。
+struct lp_io { int in_rc, out_rc; uint64_t in, out; };
 static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned nvn, int compute, int gs_topology,
                          uint32_t shared_limit,
                          struct jw *stages, struct jw *binds, int *bind_sep, uint32_t *stage_mask,
-                         uint32_t *support_bytes, char *why, size_t why_size) {
+                         uint32_t *support_bytes, struct lp_io *io, char *why, size_t why_size) {
     const char *lib_stage = lp_nvn_stage_name(nvn);
     if (!lib_stage) return 1;   // tcs/tes：vk 库不出此阶段，整个程序按 miss
     int gs = !strcmp(lib_stage, "gs");
@@ -621,6 +714,7 @@ static int lp_stage_emit(struct s2a_libpack *lp, const uint8_t key[8], unsigned 
             if (sn != sn0 && !atomic_exchange(&lp->caps_said, 1))   // 每局首次一行（信息级），之后只计数
                 LP_LOG("libpack_caps_stripped: program %s %s dropped %zu unused 64-bit capability declaration(s) (Float64/Int64 without a 64-bit type); counted per module, first one this session",
                        khex, sname, (sn0 - sn) / 8); }
+        if (io) { io->in_rc = s2a_libpack_spv_io_locations(spv, sn, 1, &io->in); io->out_rc = s2a_libpack_spv_io_locations(spv, sn, 3, &io->out); }
         // 带几何的程序：每一段都不许写视口号 / 视口掩码（lp_spv_viewport_builtin，同现编具名拒）
         if (gs_topology >= 0) {
             int vp = lp_spv_viewport_builtin(spv, sn);
@@ -752,10 +846,11 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     int worst = S2A_LIBPACK_HIT;
     struct jw st = {0}, bd = {0};
     int sep = 0; uint32_t got = 0, support = 0;
+    struct lp_io io[6] = {{ -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }};   // 按取键顺序（vs、fs、gs…）
     for (unsigned nvn = 0, idx = 0; nvn < 6 && idx < 6; nvn++) {
         if (!(stages & (1u << nvn))) continue;
         char sw[192] = "";
-        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, &st, &bd, &sep, &got, &support, sw, sizeof sw);
+        int rc = lp_stage_emit(lp, keys[idx], nvn, 0, gs_topology, 0, &st, &bd, &sep, &got, &support, &io[idx], sw, sizeof sw);
         idx++;
         if (rc == 0) continue;
         // 半程序不命中：任一所需阶段拿不到，整个程序按该段的 miss/reject 计
@@ -765,6 +860,22 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
     }
     if (worst != S2A_LIBPACK_HIT || got != stages) {
         if (worst == S2A_LIBPACK_HIT) worst = S2A_LIBPACK_MISS;   // 阶段位图对不上 = 库没有，miss
+        goto out;
+    }
+    // vs+fs 接口核对：两段是逐键独立翻的，fs 读了 vs 没声明的用户位置，驱动建管线时直接拒（Adreno：input … not declared in output from previous stage）。
+    //   退回现编（#1273：现编按 requires_linked_varying_interface 链接编译，缺的输出补 (0,0,0,1)）；读不懂的（-1）不核、照旧放行。
+    //   三段（vs+gs+fs）没有读数，这里不核。
+    if (stages == 0x3 && io[0].out_rc == 0 && io[1].in_rc == 0 && (io[1].in & ~io[0].out)) {
+        const uint64_t unwritten = io[1].in & ~io[0].out;
+        char kv[17], kf[17];
+        for (int i = 0; i < 8; i++) { snprintf(kv + 2 * i, 3, "%02x", keys[0][i]); snprintf(kf + 2 * i, 3, "%02x", keys[1][i]); }
+        lp_fail(why, why_size, "varying_interface_unlinked: vs %s writes 0x%llx, fs %s reads 0x%llx, unwritten 0x%llx",
+                kv, (unsigned long long)io[0].out, kf, (unsigned long long)io[1].in, (unsigned long long)unwritten);
+        if (atomic_fetch_add(&g_iface_rejects, 1) < LP_IFACE_LOG_MAX)   // 前几条各打一行，之后只计数（s2a_libpack_iface_rejects）
+            LP_LOG("libpack_varying_unlinked: vs %s writes user locations 0x%llx, fs %s reads 0x%llx (unwritten 0x%llx); "
+                   "the driver would reject this pair, falling back to live compile",
+                   kv, (unsigned long long)io[0].out, kf, (unsigned long long)io[1].in, (unsigned long long)unwritten);
+        worst = S2A_LIBPACK_REJECT;
         goto out;
     }
     {
@@ -809,7 +920,7 @@ int s2a_libpack_compute_v1(const struct s2a_libpack *lp_c, const uint8_t key[8],
     struct jw st = {0}, bd = {0};
     int sep = 0; uint32_t got = 0;
     uint32_t csupport = 0;
-    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, &st, &bd, &sep, &got, &csupport, why, why_size);
+    int rc = lp_stage_emit(lp, key, 5, 1, -1, shared_limit, &st, &bd, &sep, &got, &csupport, NULL, why, why_size);
     if (rc == 0 && got != (1u << 5)) rc = S2A_LIBPACK_MISS;
     if (rc == 0) {
         struct jw j = {0};
