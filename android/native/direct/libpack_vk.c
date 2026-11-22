@@ -873,7 +873,7 @@ int s2a_libpack_program_v1(const struct s2a_libpack *lp_c, const uint8_t keys[6]
                 kv, (unsigned long long)io[0].out, kf, (unsigned long long)io[1].in, (unsigned long long)unwritten);
         if (atomic_fetch_add(&g_iface_rejects, 1) < LP_IFACE_LOG_MAX)   // 前几条各打一行，之后只计数（s2a_libpack_iface_rejects）
             LP_LOG("libpack_varying_unlinked: vs %s writes user locations 0x%llx, fs %s reads 0x%llx (unwritten 0x%llx); "
-                   "the driver would reject this pair, falling back to live compile",
+                   "the library pair has no linked interface, falling back to live compile",
                    kv, (unsigned long long)io[0].out, kf, (unsigned long long)io[1].in, (unsigned long long)unwritten);
         worst = S2A_LIBPACK_REJECT;
         goto out;

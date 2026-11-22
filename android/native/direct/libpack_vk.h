@@ -22,7 +22,7 @@ extern "C" {
 enum {
     S2A_LIBPACK_HIT = 0,      // 全部阶段都有，v1 字节已合成
     S2A_LIBPACK_MISS = 1,     // 容器不在、某键某段不在、或阶段在库外出路（tcs/tes、没开 geometryShader 的几何）
-    S2A_LIBPACK_REJECT = -1,  // 找到了但不可接受：容器坏/段坏/json 坏/键不符/绑定种类译不出
+    S2A_LIBPACK_REJECT = -1,  // 找到了但不可接受：容器坏/段坏/json 坏/键不符/绑定种类译不出/vs+fs 接口对不上
     S2A_LIBPACK_INVALID = -2, // 调用方参数错
 };
 
